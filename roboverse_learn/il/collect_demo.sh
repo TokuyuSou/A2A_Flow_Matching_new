@@ -1,6 +1,10 @@
 ## run nvidia-smi to check available GPUs
 export CUDA_VISIBLE_DEVICES=0
 
+## Force IsaacSim to exit cleanly after close (avoid shutdown hang)
+export METASIM_FORCE_EXIT_ON_CLOSE=1
+export METASIM_CLOSE_TIMEOUT_SEC=8
+
 ## Parameters
 task_name_set=close_box
 random_level=0
