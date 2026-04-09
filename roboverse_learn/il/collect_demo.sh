@@ -5,12 +5,16 @@ export CUDA_VISIBLE_DEVICES=0
 export METASIM_FORCE_EXIT_ON_CLOSE=1
 export METASIM_CLOSE_TIMEOUT_SEC=8
 
+set -euo pipefail
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+
 ## Parameters
 task_name_set=close_box
 random_level=0
 num_envs=1              # Number of parallel environments
 demo_start_idx=0        # Index of the first demo to collect
-sim_set=isaacsim
+sim_set=mujoco
 cust_name=test
 num_demo_success=50
 
