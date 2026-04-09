@@ -431,7 +431,6 @@ class DefaultRunner(BaseRunner):
                     (self.epoch + 1) % cfg.train_config.training_params.checkpoint_every
                 ) == 0 or self.epoch + 1 >= cfg.train_config.training_params.num_epochs:
                     # checkpointing
-                    save_name = pathlib.Path(self.cfg.dataset_config.zarr_path).stem
                     self.save_checkpoint(
                         cfg.checkpoint.save_root_dir
                         + f"/checkpoints/{self.epoch + 1}.ckpt"

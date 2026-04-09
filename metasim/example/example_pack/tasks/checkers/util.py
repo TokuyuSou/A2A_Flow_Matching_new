@@ -75,7 +75,7 @@ def get_dof_pos(
     else:
         raise KeyError(f"{obj_name} not found")
 
-    j_idx = handler._get_joint_names(obj_name).index(joint_name)
+    j_idx = handler.get_joint_names(obj_name).index(joint_name)
     norm_joint = _normalize_env_slice(joint_tensor, env_ids, handler)
     dof_pos = norm_joint[:, j_idx]
 
