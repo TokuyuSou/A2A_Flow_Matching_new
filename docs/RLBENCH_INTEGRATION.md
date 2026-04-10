@@ -391,6 +391,43 @@ Xvfb :99 -screen 0 1280x1024x24 &
 export DISPLAY=:99
 ```
 
+### Qt platform plugin "xcb" のロードに失敗する
+
+環境によっては、`DISPLAY` と `LD_LIBRARY_PATH` を設定しても以下のエラーが発生する場合があります。
+
+```
+qt.qpa.plugin: Could not load the Qt platform plugin "xcb" in "/root/CoppeliaSim" even though it was found.
+This application failed to start because no Qt platform plugin could be initialized.
+```
+
+これは CoppeliaSim 同梱の xcb プラットフォームプラグイン (`platforms/libqxcb.so`) が
+依存するシステムライブラリが不足していることが原因です。
+
+**1. 不足ライブラリのインストール**
+
+```bash
+sudo apt-get install -y libxkbcommon-x11-0 libxkbcommon0 libfontconfig1 libdbus-1-3
+```
+
+**2. CoppeliaSim の Qt ライブラリを `LD_LIBRARY_PATH` に含める**
+
+`~/.bashrc` 等の環境変数設定で、`$COPPELIASIM_ROOT` が `LD_LIBRARY_PATH` に含まれていることを確認してください
+（セクション 2.2 の設定が反映されていれば追加作業は不要です）。
+
+```bash
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$COPPELIASIM_ROOT
+```
+
+**3. 確認方法**
+
+依存がすべて解決されているかは以下で確認できます。
+
+```bash
+ldd $COPPELIASIM_ROOT/platforms/libqxcb.so | grep "not found"
+```
+
+出力が空であれば問題ありません。`not found` が残っている場合は、該当ライブラリを `apt-get install` で追加してください。
+
 ### Zarr 変換時の `AttributeError: Can't get attribute 'Observation'`
 
 `rlbench2zarr.py` は `_PermissiveUnpickler` を使用しており、
