@@ -175,25 +175,34 @@ if [ "${eval_enable}" = "True" ]; then
     echo ""
     echo "=== Step 3: Evaluating on RLBench ==="
 
-    eval_task="${task_array[0]}"
-
     if [ ! -f "${eval_path}" ]; then
         echo "ERROR: Checkpoint not found at ${eval_path}"
         exit 1
     fi
 
-    python roboverse_learn/il/rlbench_eval.py \
-        --checkpoint "${eval_path}" \
-        --task_name "${eval_task}" \
-        --num_episodes "${eval_num_episodes}" \
-        --max_steps "${eval_max_steps}" \
-        --camera "${camera}" \
-        --image_size "${image_size}" \
-        --variation "${variation}" \
-        --device "cuda:${gpu}" \
-        --dataset_root "${dataset_root}" \
-        --num_workers "${eval_num_workers}" \
-        ${headless}
+    for eval_task in "${task_array[@]}"; do
+        echo ""
+        echo "--- Evaluating task: ${eval_task} ---"
+        eval_dir="${output_dir}/${combined_name}/eval/${eval_task}"
+
+        python roboverse_learn/il/rlbench_eval.py \
+            --checkpoint "${eval_path}" \
+            --task_name "${eval_task}" \
+            --num_episodes "${eval_num_episodes}" \
+            --max_steps "${eval_max_steps}" \
+            --camera "${camera}" \
+            --image_size "${image_size}" \
+            --variation "${variation}" \
+            --device "cuda:${gpu}" \
+            --dataset_root "${dataset_root}" \
+            --num_workers "${eval_num_workers}" \
+            --eval_dir "${eval_dir}" \
+            ${headless}
+
+        if [ $? -ne 0 ]; then
+            echo "WARNING: Evaluation failed for task: ${eval_task}"
+        fi
+    done
 else
     echo ""
     echo "=== Step 3: Evaluation skipped (eval_enable=False) ==="
