@@ -172,6 +172,11 @@ class A2AImagePolicy(BaseImagePolicy):
         """Set the task embedding to use during predict_action (evaluation)."""
         if not hasattr(self, 'task_embeddings') or self.task_names is None:
             return
+        if task_name not in self.task_names:
+            raise ValueError(
+                f"Task '{task_name}' not found in checkpoint. "
+                f"Available tasks: {self.task_names}"
+            )
         idx = self.task_names.index(task_name)
         # Store as (1, task_embed_dim) for easy broadcast
         self._eval_task_cond = self.task_embeddings[idx : idx + 1]

@@ -9,11 +9,19 @@ parallel, each with its own CoppeliaSim instance.
 
 Usage
 -----
+# Single task:
 python roboverse_learn/il/rlbench_eval.py \
     --checkpoint /path/to/checkpoint.ckpt \
     --task_name reach_target \
     --num_episodes 25 \
     --num_workers 4 \
+    --headless
+
+# Multiple tasks (multi-task checkpoint):
+python roboverse_learn/il/rlbench_eval.py \
+    --checkpoint /path/to/checkpoint.ckpt \
+    --task_name "reach_target+close_jar" \
+    --num_episodes 25 \
     --headless
 """
 
@@ -153,7 +161,7 @@ def stack_obs(obs_history, n_steps: int):
     return result
 
 
-def run_episodes(worker_id, episode_ids, args, result_queue):
+def run_episodes(worker_id, episode_ids, task_name, eval_dir, args, result_queue):
     """Worker function: launch its own CoppeliaSim, run assigned episodes."""
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -161,7 +169,7 @@ def run_episodes(worker_id, episode_ids, args, result_queue):
 
     # Set task embedding for evaluation (multi-task models)
     if hasattr(policy, 'set_eval_task'):
-        policy.set_eval_task(args.task_name)
+        policy.set_eval_task(task_name)
 
     obs_config = build_obs_config(args.camera, args.image_size)
     action_mode = MoveArmThenGripper(
@@ -176,11 +184,11 @@ def run_episodes(worker_id, episode_ids, args, result_queue):
     )
     env.launch()
 
-    task_class = rlbench_utils.name_to_task_class(args.task_name)
+    task_class = rlbench_utils.name_to_task_class(task_name)
     task_env = env.get_task(task_class)
     task_env.set_variation(args.variation)
 
-    video_dir = os.path.join(args.eval_dir, "videos")
+    video_dir = os.path.join(eval_dir, "videos")
     results = []
 
     for ep in episode_ids:
@@ -243,11 +251,46 @@ def run_episodes(worker_id, episode_ids, args, result_queue):
     result_queue.put(results)
 
 
+def evaluate_single_task(task_name, eval_dir, args):
+    """Run evaluation for a single task. Returns list of (ep, success, steps)."""
+    os.makedirs(os.path.join(eval_dir, "videos"), exist_ok=True)
+
+    num_workers = max(1, args.num_workers)
+    all_episodes = list(range(args.num_episodes))
+    chunks = [all_episodes[i::num_workers] for i in range(num_workers)]
+
+    if num_workers == 1:
+        result_queue = mp.Queue()
+        run_episodes(0, chunks[0], task_name, eval_dir, args, result_queue)
+        all_results = result_queue.get()
+    else:
+        print(f"Launching {num_workers} parallel workers for {args.num_episodes} episodes...")
+        result_queue = mp.Queue()
+        processes = []
+        for wid, chunk in enumerate(chunks):
+            if len(chunk) == 0:
+                continue
+            p = mp.Process(target=run_episodes,
+                           args=(wid, chunk, task_name, eval_dir, args, result_queue))
+            p.start()
+            processes.append(p)
+
+        all_results = []
+        for _ in processes:
+            all_results.extend(result_queue.get())
+        for p in processes:
+            p.join()
+
+    all_results.sort(key=lambda x: x[0])
+    return all_results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate A2A policy on RLBench.")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--task_name", type=str, required=True,
-                        help="RLBench task name (e.g. reach_target)")
+                        help="RLBench task name(s). Use '+' to separate multiple tasks "
+                             "(e.g. 'reach_target+close_jar')")
     parser.add_argument("--num_episodes", type=int, default=25)
     parser.add_argument("--max_steps", type=int, default=200,
                         help="Max steps per episode")
@@ -266,60 +309,83 @@ def main():
                         help="Number of parallel CoppeliaSim workers.")
     args = parser.parse_args()
 
+    task_list = args.task_name.split('+')
+    multi_task = len(task_list) > 1
+
     # Default eval_dir: <task_dir>/eval
-    # e.g. il_outputs/a2a/close_box_open_box/eval
     if args.eval_dir is None:
         task_dir = os.path.dirname(os.path.dirname(args.checkpoint))
         args.eval_dir = os.path.join(task_dir, "eval")
 
-    os.makedirs(os.path.join(args.eval_dir, "videos"), exist_ok=True)
+    # --- Validate task names against checkpoint ---
+    print(f"Loading checkpoint: {args.checkpoint}")
+    policy, _, _, _ = load_policy(args.checkpoint, "cpu")
+    available_tasks = getattr(policy, 'task_names', None)
 
-    num_workers = max(1, args.num_workers)
-    all_episodes = list(range(args.num_episodes))
-    chunks = [all_episodes[i::num_workers] for i in range(num_workers)]
-
-    if num_workers == 1:
-        result_queue = mp.Queue()
-        run_episodes(0, chunks[0], args, result_queue)
-        all_results = result_queue.get()
+    if available_tasks is not None:
+        # Multi-task model: validate requested tasks
+        for t in task_list:
+            if t not in available_tasks:
+                print(f"\nERROR: Task '{t}' not found in checkpoint.\n"
+                      f"Available tasks: {available_tasks}\n"
+                      f"Use '+' to join multiple tasks, e.g. --task_name '{'+'.join(available_tasks)}'")
+                sys.exit(1)
+        print(f"Multi-task checkpoint. Available tasks: {available_tasks}")
+        if not multi_task and len(available_tasks) > 1:
+            print(f"TIP: This checkpoint supports {len(available_tasks)} tasks. "
+                  f"To evaluate all, use: --task_name '{'+'.join(available_tasks)}'")
     else:
-        print(f"Launching {num_workers} parallel workers for {args.num_episodes} episodes...")
-        result_queue = mp.Queue()
-        processes = []
-        for wid, chunk in enumerate(chunks):
-            if len(chunk) == 0:
-                continue
-            p = mp.Process(target=run_episodes, args=(wid, chunk, args, result_queue))
-            p.start()
-            processes.append(p)
+        if multi_task:
+            print("WARNING: This is a single-task checkpoint (no task embeddings). "
+                  "Each task will be evaluated without task conditioning.")
 
-        all_results = []
-        for _ in processes:
-            all_results.extend(result_queue.get())
-        for p in processes:
-            p.join()
+    del policy
 
-    # Sort by episode id and print summary
-    all_results.sort(key=lambda x: x[0])
-    successes = sum(1 for _, s, _ in all_results if s)
-    total = len(all_results)
+    # --- Evaluate each task ---
+    summary = {}
 
-    print(f"\n{'=' * 50}")
-    print(f"Task: {args.task_name} (variation {args.variation})")
-    print(f"Success rate: {successes}/{total} = {successes / total:.1%}")
-    if num_workers > 1:
-        print(f"Workers: {num_workers}")
-    print(f"{'=' * 50}")
+    for task_name in task_list:
+        print(f"\n{'=' * 50}")
+        print(f"Evaluating task: {task_name}")
+        print(f"{'=' * 50}")
 
-    # Save results text file
-    results_path = os.path.join(args.eval_dir, "results.txt")
-    with open(results_path, "w") as f:
-        for ep, success, steps in all_results:
-            f.write(f"Episode {ep:03d}: {'SUCCESS' if success else 'FAIL'} (steps={steps})\n")
-        f.write(f"\nTask: {args.task_name} (variation {args.variation})\n")
-        f.write(f"Checkpoint: {args.checkpoint}\n")
-        f.write(f"Success rate: {successes}/{total} = {successes / total:.1%}\n")
-    print(f"Results saved to {results_path}")
+        task_eval_dir = os.path.join(args.eval_dir, task_name) if multi_task else args.eval_dir
+        results = evaluate_single_task(task_name, task_eval_dir, args)
+
+        successes = sum(1 for _, s, _ in results if s)
+        total = len(results)
+        summary[task_name] = (successes, total)
+
+        print(f"\n{'=' * 50}")
+        print(f"Task: {task_name} (variation {args.variation})")
+        print(f"Success rate: {successes}/{total} = {successes / total:.1%}")
+        if args.num_workers > 1:
+            print(f"Workers: {args.num_workers}")
+        print(f"{'=' * 50}")
+
+        # Save per-task results
+        results_path = os.path.join(task_eval_dir, "results.txt")
+        with open(results_path, "w") as f:
+            for ep, success, steps in results:
+                f.write(f"Episode {ep:03d}: {'SUCCESS' if success else 'FAIL'} (steps={steps})\n")
+            f.write(f"\nTask: {task_name} (variation {args.variation})\n")
+            f.write(f"Checkpoint: {args.checkpoint}\n")
+            f.write(f"Success rate: {successes}/{total} = {successes / total:.1%}\n")
+        print(f"Results saved to {results_path}")
+
+    # Overall summary for multi-task
+    if multi_task:
+        print(f"\n{'=' * 50}")
+        print("Overall Summary")
+        print(f"{'=' * 50}")
+        total_success = 0
+        total_episodes = 0
+        for t, (s, n) in summary.items():
+            print(f"  {t}: {s}/{n} = {s / n:.1%}")
+            total_success += s
+            total_episodes += n
+        print(f"  Average: {total_success}/{total_episodes} = {total_success / total_episodes:.1%}")
+        print(f"{'=' * 50}")
 
 
 if __name__ == "__main__":
