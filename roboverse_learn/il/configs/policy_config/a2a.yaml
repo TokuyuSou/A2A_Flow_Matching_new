@@ -33,6 +33,10 @@ enc_contrastive_weight: 0.0
 flow_contrastive_weight: 0.0
 latent_dim: 512
 
+# Task embedding (set to dict {task_name: description} for multi-task conditioning)
+task_descriptions: null
+task_encoder_name: all-mpnet-base-v2
+
 # Flow matcher parameters
 flow_matcher:
   _target_: roboverse_learn.il.utils.flow.flow_matchers.ConditionalFlowMatcher

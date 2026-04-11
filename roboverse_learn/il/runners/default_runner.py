@@ -404,7 +404,10 @@ class DefaultRunner(BaseRunner):
                         obs_dict = batch["obs"]
                         gt_action = batch["action"]
 
-                        result = policy.predict_action(obs_dict)
+                        result = policy.predict_action(
+                            obs_dict,
+                            task_idx=batch.get("task_idx"),
+                        )
                         pred_action = result["action_pred"]
                         
                         # Handle shape mismatch (e.g., VITA action-to-action flow outputs 8 frames from horizon=16)
@@ -586,6 +589,10 @@ class DefaultRunner(BaseRunner):
             task_name=args.task,
             subset=args.subset,
         )
+
+        # Set task embedding for evaluation
+        if hasattr(policyRunner.policy, 'set_eval_task'):
+            policyRunner.policy.set_eval_task(args.task)
 
         action_set_steps = (
             2 if policyRunner.policy_cfg.action_config.action_type == "ee" else 1

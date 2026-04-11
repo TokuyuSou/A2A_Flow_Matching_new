@@ -159,6 +159,10 @@ def run_episodes(worker_id, episode_ids, args, result_queue):
 
     policy, cfg, n_obs_steps, n_action_steps = load_policy(args.checkpoint, str(device))
 
+    # Set task embedding for evaluation (multi-task models)
+    if hasattr(policy, 'set_eval_task'):
+        policy.set_eval_task(args.task_name)
+
     obs_config = build_obs_config(args.camera, args.image_size)
     action_mode = MoveArmThenGripper(
         arm_action_mode=JointPosition(absolute_mode=True),

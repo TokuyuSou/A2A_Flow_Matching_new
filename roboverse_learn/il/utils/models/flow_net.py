@@ -180,7 +180,7 @@ class FlowTransformer(nn.Module):
 
 
 class FlowNetLayer(nn.Module):
-    def __init__(self, dim, mlp_ratio=4., dropout=0.0):
+    def __init__(self, dim, mlp_ratio=4., dropout=0.0, has_task_cond=False):
         super().__init__()
         def approx_gelu(): return nn.GELU(approximate="tanh")
 
@@ -199,16 +199,35 @@ class FlowNetLayer(nn.Module):
         )
         self.dim = dim
 
+        # Task FiLM modulator (scale + shift), zero-initialized
+        if has_task_cond:
+            self.task_modulator = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(dim, 2 * dim)
+            )
+        else:
+            self.task_modulator = None
+
         self._init_weights()
 
     def _init_weights(self):
         nn.init.constant_(self.time_modulator[-1].weight, 0)
         nn.init.constant_(self.time_modulator[-1].bias, 0)
+        if self.task_modulator is not None:
+            nn.init.constant_(self.task_modulator[-1].weight, 0)
+            nn.init.constant_(self.task_modulator[-1].bias, 0)
 
-    def forward(self, x, t):
+    def forward(self, x, t, task_cond=None):
         B = x.shape[0]
         features = self.time_modulator(t).view(B, 3, self.dim).unbind(1)
         gamma, scale, shift = features
+
+        # Additive task FiLM modulation
+        if task_cond is not None and self.task_modulator is not None:
+            task_features = self.task_modulator(task_cond).view(B, 2, self.dim).unbind(1)
+            t_scale, t_shift = task_features
+            scale = scale + t_scale
+            shift = shift + t_shift
 
         x_norm = self.norm(x)
         x_norm = x_norm.mul(scale.add(1)).add_(shift)
@@ -230,11 +249,13 @@ class SimpleFlowNet(nn.Module):
         dropout=0.0,
         time_embed_dim=256,
         condition_dim=None,  # Optional: dimension of condition (e.g., obs_latents)
+        task_embed_dim=None,  # Optional: dimension of task embedding (e.g., 768 from SentenceTransformer)
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.condition_dim = condition_dim
+        self.task_embed_dim = task_embed_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(time_embed_dim),
@@ -242,18 +263,26 @@ class SimpleFlowNet(nn.Module):
             nn.Mish(),
             nn.Linear(time_embed_dim * 4, hidden_dim),
         )
-        
+
         # Condition embedding (optional)
         if condition_dim is not None:
             self.cond_embed = nn.Linear(condition_dim, hidden_dim)
         else:
             self.cond_embed = None
 
+        # Task embedding projection (optional)
+        if task_embed_dim is not None:
+            self.task_proj = nn.Linear(task_embed_dim, hidden_dim)
+        else:
+            self.task_proj = None
+
+        has_task_cond = task_embed_dim is not None
         self.layers = nn.ModuleList([
             FlowNetLayer(
                 dim=hidden_dim,
                 mlp_ratio=mlp_ratio,
-                dropout=dropout
+                dropout=dropout,
+                has_task_cond=has_task_cond,
             ) for _ in range(num_layers)
         ])
 
@@ -275,17 +304,26 @@ class SimpleFlowNet(nn.Module):
         nn.init.normal_(self.time_embed[1].weight, std=0.02)
         nn.init.normal_(self.time_embed[3].weight, std=0.02)
 
-    def forward(self, x, t, global_cond=None):
+        # Re-apply FlowNetLayer zero-inits (basic_init above may have overwritten them)
+        for layer in self.layers:
+            layer._init_weights()
+
+    def forward(self, x, t, global_cond=None, task_cond=None):
         x = self.input_proj(x)
         t = self.time_embed(t)
-        
+
         # Add condition to time embedding if provided
         if global_cond is not None and self.cond_embed is not None:
             c = self.cond_embed(global_cond)
             t = t + c  # Inject condition into modulation signal
 
+        # Project task condition (separate from time+obs path)
+        tc = None
+        if task_cond is not None and self.task_proj is not None:
+            tc = self.task_proj(task_cond)  # (B, task_embed_dim) -> (B, hidden_dim)
+
         for block in self.layers:
-            x = block(x, t)
+            x = block(x, t, task_cond=tc)
 
         x = self.norm(x)
         x = self.out_proj(x)

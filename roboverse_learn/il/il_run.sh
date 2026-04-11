@@ -181,10 +181,22 @@ else
         fi
     done
 
+    # Build task_descriptions dict for task embedding: {task_name: "human readable description"}
+    task_descs_entries=""
+    for task in "${task_array[@]}"; do
+        desc="${task//_/ }"
+        if [ -z "${task_descs_entries}" ]; then
+            task_descs_entries="${task}: '${desc}'"
+        else
+            task_descs_entries="${task_descs_entries}, ${task}: '${desc}'"
+        fi
+    done
+
     python ${main_script} --config-name=${config_name}.yaml \
     dataset_config=multi_task_robot_image_dataset \
     task_name=${combined_task_name} \
     "dataset_config.zarr_paths=[${zarr_paths_list}]" \
+    "+policy_config.task_descriptions={${task_descs_entries}}" \
     train_config.training_params.seed=${seed} \
     train_config.training_params.num_epochs=${num_epochs} \
     train_config.training_params.device=${gpu} \

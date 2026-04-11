@@ -145,6 +145,7 @@ def _merge_replay_buffers(buffers: List[ReplayBuffer]) -> ReplayBuffer:
 
     Concatenates data arrays and adjusts episode_ends offsets accordingly.
     All buffers must share the same data keys and compatible array shapes.
+    Also creates a ``task_idx`` array so each timestep knows which source task it belongs to.
     """
     keys = list(buffers[0].keys())
 
@@ -153,6 +154,12 @@ def _merge_replay_buffers(buffers: List[ReplayBuffer]) -> ReplayBuffer:
         key: np.concatenate([rb[key] for rb in buffers], axis=0)
         for key in keys
     }
+
+    # Build per-timestep task index (int64 scalar per frame)
+    task_idx_parts = []
+    for i, rb in enumerate(buffers):
+        task_idx_parts.append(np.full((rb.n_steps,), i, dtype=np.int64))
+    merged_data["task_idx"] = np.concatenate(task_idx_parts, axis=0)
 
     # Merge episode_ends: shift each buffer's ends by the cumulative frame count
     all_episode_ends = []
@@ -320,13 +327,16 @@ class MultiTaskRobotImageDataset(BaseImageDataset):
         agent_pos = samples["state"].to(device, non_blocking=True)
         head_cam = samples["head_camera"].to(device, non_blocking=True) / 255.0
         action = samples["action"].to(device, non_blocking=True)
-        return {
+        result = {
             "obs": {
                 "head_cam": head_cam,
                 "agent_pos": agent_pos,
             },
             "action": action,
         }
+        if "task_idx" in samples:
+            result["task_idx"] = samples["task_idx"].to(device, non_blocking=True)
+        return result
 
 
 def _batch_sample_sequence(

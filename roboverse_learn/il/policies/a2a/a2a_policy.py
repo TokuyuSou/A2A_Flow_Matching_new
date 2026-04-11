@@ -56,6 +56,9 @@ class A2AImagePolicy(BaseImagePolicy):
         flow_contrastive_weight=0.0,
         latent_dim=512,
         action_ae=None,
+        # Task embedding params
+        task_descriptions=None,  # dict: {task_name: description} or None
+        task_encoder_name='all-mpnet-base-v2',
         **kwargs,
     ):
         super().__init__()
@@ -77,6 +80,24 @@ class A2AImagePolicy(BaseImagePolicy):
         self.flow_matcher = flow_matcher
         self.action_ae = action_ae
 
+        # --- Task embedding (frozen SentenceTransformer) ---
+        task_embed_dim = None
+        if task_descriptions is not None and len(task_descriptions) > 0:
+            from sentence_transformers import SentenceTransformer
+            task_names = list(task_descriptions.keys())
+            descriptions = [task_descriptions[k] for k in task_names]
+            encoder = SentenceTransformer(task_encoder_name)
+            with torch.no_grad():
+                emb = encoder.encode(descriptions, convert_to_tensor=True)  # (num_tasks, D)
+            self.register_buffer('task_embeddings', emb.float().clone())
+            task_embed_dim = emb.shape[-1]
+            self.task_names = task_names
+            del encoder  # free the encoder after embedding
+        else:
+            self.task_names = None
+
+        self._eval_task_cond = None  # set via set_eval_task() for inference
+
         # Visual observation encoder
         self.obs_encoder = obs_encoder
         self.obs_projector = nn.Linear(
@@ -93,6 +114,7 @@ class A2AImagePolicy(BaseImagePolicy):
             mlp_ratio=flow_net.mlp_ratio,
             dropout=flow_net.dropout,
             condition_dim=latent_dim,  # obs_latents as condition
+            task_embed_dim=task_embed_dim,
         )
         
         # History state encoder
@@ -138,12 +160,31 @@ class A2AImagePolicy(BaseImagePolicy):
         self.n_obs_steps = n_obs_steps
         self.kwargs = kwargs
 
+    def _get_task_cond(self, batch):
+        """Look up pre-computed task embeddings from batch task_idx."""
+        if not hasattr(self, 'task_embeddings') or 'task_idx' not in batch:
+            return None
+        # task_idx shape: (B, T) – constant within each sequence, take first timestep
+        task_idx = batch['task_idx'][:, 0].long()
+        return self.task_embeddings[task_idx]  # (B, task_embed_dim)
+
+    def set_eval_task(self, task_name):
+        """Set the task embedding to use during predict_action (evaluation)."""
+        if not hasattr(self, 'task_embeddings') or self.task_names is None:
+            return
+        idx = self.task_names.index(task_name)
+        # Store as (1, task_embed_dim) for easy broadcast
+        self._eval_task_cond = self.task_embeddings[idx : idx + 1]
+
     def compute_loss(self, batch):
         # normalize input
         assert "valid_mask" not in batch
         nobs = self.normalizer.normalize(batch["obs"])
         nactions = self.normalizer["action"].normalize(batch["action"])
         batch_size = nactions.shape[0]
+
+        # Task condition
+        task_cond = self._get_task_cond(batch)
 
         # Encode visual observations
         # reshape B, T, ... to B*T for image encoding
@@ -155,21 +196,22 @@ class A2AImagePolicy(BaseImagePolicy):
         # Encode history states (8 frames ending at current time)
         history_states = nobs["agent_pos"][:, :self.n_obs_steps, :]  # (B, 8, D)
         history_latents = self.history_action_encoder(history_states)
-        
+
         # Encode future actions (8 frames starting from current time)
         future_start = self.n_obs_steps - 1  # = 7 (current time index)
         future_end = future_start + self.n_action_steps  # = 7 + 8 = 15
         future_actions = nactions[:, future_start:future_end, :]  # (B, 8, D)
         future_action_latents = self.action_encoder(future_actions)
-        
+
         # Flow matching: history_latents -> future_action_latents, conditioned on obs_latents
         flow_loss, metrics = self.flow_matcher.compute_loss(
             self.flow_net,
             target=future_action_latents,
             start=history_latents,  # History states as flow source
             global_cond=obs_latents,  # Visual observations as condition
+            task_cond=task_cond,
         )
-        
+
         loss = flow_loss
         metrics['flow_loss'] = flow_loss.item()
 
@@ -191,6 +233,7 @@ class A2AImagePolicy(BaseImagePolicy):
                 start=history_latents,
                 num_steps=self.num_sampling_steps,
                 global_cond=obs_latents,
+                task_cond=task_cond,
             )
 
             if self.consistency_weight > 0:
@@ -222,7 +265,11 @@ class A2AImagePolicy(BaseImagePolicy):
 
         return loss
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        task_idx: torch.Tensor = None,
+    ) -> Dict[str, torch.Tensor]:
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
         value = next(iter(nobs.values()))
@@ -239,7 +286,14 @@ class A2AImagePolicy(BaseImagePolicy):
         # These are the past n_obs_steps states: [s_{t-n+1}, ..., s_t]
         history_states = nobs["agent_pos"][:, :self.n_obs_steps, :]  # (B, n_obs_steps, D)
         history_latents = self.history_action_encoder(history_states)
-        
+
+        # Task condition: expand (1, D) -> (B, D) for eval
+        task_cond = None
+        if task_idx is not None and hasattr(self, 'task_embeddings'):
+            task_cond = self.task_embeddings[task_idx[:, 0].long()]
+        elif self._eval_task_cond is not None:
+            task_cond = self._eval_task_cond.expand(B, -1)
+
         # Run flow sampling: history -> future, conditioned on visual obs
         action_latents_pred = self.flow_matcher.sample(
             self.flow_net,
@@ -248,6 +302,7 @@ class A2AImagePolicy(BaseImagePolicy):
             num_steps=self.num_sampling_steps,
             start=history_latents,  # History states as flow source
             global_cond=obs_latents,  # Visual observations as condition
+            task_cond=task_cond,
             return_traces=False
         )
 
@@ -334,6 +389,11 @@ class A2AImagePolicy(BaseImagePolicy):
         future_actions = nactions[:n_samples, future_start:future_end, :]
         future_latents = self.action_encoder(future_actions)
         
+        # Task condition for visualization
+        task_cond = self._get_task_cond(batch) if 'task_idx' in batch else None
+        if task_cond is not None:
+            task_cond = task_cond[:n_samples]
+
         # Run flow sampling with traces
         _, (traj_history, _) = self.flow_matcher.sample(
             self.flow_net,
@@ -342,6 +402,7 @@ class A2AImagePolicy(BaseImagePolicy):
             num_steps=num_steps,
             start=history_latents,
             global_cond=obs_latents,
+            task_cond=task_cond,
             return_traces=True
         )
         
