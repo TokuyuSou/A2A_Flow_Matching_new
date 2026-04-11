@@ -3,6 +3,7 @@ import pathlib
 import sys
 
 import hydra
+import torch.distributed as dist
 from omegaconf import OmegaConf
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -18,10 +19,18 @@ OmegaConf.register_new_resolver("eval", eval, replace=True)
 def main(cfg):
     OmegaConf.resolve(cfg)
 
-    cls = hydra.utils.get_class(cfg._target_)
+    # Initialize distributed training when launched via torchrun
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
 
+    cls = hydra.utils.get_class(cfg._target_)
     runner: BaseRunner = cls(cfg)
-    runner.run()
+
+    try:
+        runner.run()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ eval_enable=True
 num_epochs=200
 seed=42
 gpu=0
+num_gpus=1            # Number of GPUs (>1 enables distributed training via torchrun)
 
 # Eval control
 eval_num_episodes=25
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --eval_enable)      eval_enable="$2"; shift 2 ;;
         --num_epochs)       num_epochs="$2"; shift 2 ;;
         --gpu)              gpu="$2"; shift 2 ;;
+        --num_gpus)         num_gpus="$2"; shift 2 ;;
         --eval_num_episodes) eval_num_episodes="$2"; shift 2 ;;
         --eval_max_steps)   eval_max_steps="$2"; shift 2 ;;
         --eval_num_workers) eval_num_workers="$2"; shift 2 ;;
@@ -128,10 +130,17 @@ if [ "${train_enable}" = "True" ]; then
     echo ""
     echo "=== Step 2: Training ${policy_name} on ${task_name} ==="
 
+    # Launcher: use torchrun for multi-GPU, plain python for single-GPU
+    if [ "${num_gpus}" -gt 1 ]; then
+        LAUNCHER="torchrun --nproc_per_node=${num_gpus}"
+    else
+        LAUNCHER="python"
+    fi
+
     if [ "${num_tasks}" -eq 1 ]; then
         zarr_path="./data_policy/${task_array[0]}_rlbench_v${variation}_${num_demos}.zarr"
 
-        python ${main_script} --config-name=${config_name}.yaml \
+        ${LAUNCHER} ${main_script} --config-name=${config_name}.yaml \
             task_name=${combined_name} \
             "dataset_config.zarr_path=${zarr_path}" \
             train_config.training_params.seed=${seed} \
@@ -155,7 +164,7 @@ if [ "${train_enable}" = "True" ]; then
             fi
         done
 
-        python ${main_script} --config-name=${config_name}.yaml \
+        ${LAUNCHER} ${main_script} --config-name=${config_name}.yaml \
             dataset_config=multi_task_robot_image_dataset \
             task_name=${combined_name} \
             "dataset_config.zarr_paths=[${zarr_paths_list}]" \

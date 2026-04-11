@@ -7,7 +7,7 @@ training_params:
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 1000
-  gradient_accumulate_every: 1
+  gradient_accumulate_every: 10
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True

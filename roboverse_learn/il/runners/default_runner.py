@@ -11,6 +11,7 @@ import hydra
 import imageio.v2 as iio
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 import wandb
 from loguru import logger as log
@@ -28,6 +29,16 @@ from roboverse_learn.il.utils.pytorch_util import optimizer_to
 from roboverse_learn.il.utils.visualization import plot_all_latent_visualizations
 
 RANDOMIZATION_AVAILABLE = True
+
+
+def _get_dist_info():
+    """Return (rank, local_rank, world_size, is_distributed, is_main)."""
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = world_size > 1
+    is_main = rank == 0
+    return rank, local_rank, world_size, is_distributed, is_main
 
 
 def ensure_clean_state(handler, expected_state=None):
@@ -147,19 +158,33 @@ class DefaultRunner(BaseRunner):
     def train(self):
         cfg = copy.deepcopy(self.cfg)
 
+        # --- Distributed setup ---
+        rank, local_rank, world_size, is_distributed, is_main = _get_dist_info()
+
+        if is_distributed:
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+        else:
+            device = torch.device(cfg.train_config.training_params.device)
+
+        grad_accum = cfg.train_config.training_params.gradient_accumulate_every
+
         # resume training
         if cfg.train_config.training_params.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
+                if is_main:
+                    print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
 
         # configure dataset
         dataset = hydra.utils.instantiate(cfg.dataset_config)
-        train_dataloader = create_dataloader(dataset, **cfg.train_config.dataloader)
+        train_dataloader = create_dataloader(
+            dataset, rank=rank, world_size=world_size, **cfg.train_config.dataloader
+        )
         normalizer = dataset.get_normalizer()
 
-        # configure validation dataset
+        # configure validation dataset (rank 0 only uses it, but create on all ranks for simplicity)
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = create_dataloader(
             val_dataset, **cfg.train_config.val_dataloader
@@ -177,9 +202,7 @@ class DefaultRunner(BaseRunner):
             num_training_steps=(
                 len(train_dataloader) * cfg.train_config.training_params.num_epochs
             )
-            // cfg.train_config.training_params.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
+            // grad_accum,
             last_epoch=self.global_step - 1,
         )
 
@@ -190,26 +213,20 @@ class DefaultRunner(BaseRunner):
 
         wandb_run = None
 
-        # configure logging
-        if cfg.logging.mode == "online":
-            # Truncate tags to max 64 characters (wandb limit)
+        # configure logging (rank 0 only)
+        if is_main and cfg.logging.mode == "online":
             logging_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
             if "tags" in logging_cfg and logging_cfg["tags"]:
                 logging_cfg["tags"] = [tag[:64] if len(tag) > 64 else tag for tag in logging_cfg["tags"]]
-            
+
             wandb_run = wandb.init(
                 dir=str(self.output_dir),
                 config=OmegaConf.to_container(cfg, resolve=True),
                 **logging_cfg,
             )
-            wandb.config.update(
-                {
-                    "output_dir": self.output_dir,
-                }
-            )
+            wandb.config.update({"output_dir": self.output_dir})
 
         # device transfer
-        device = torch.device(cfg.train_config.training_params.device)
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
@@ -227,11 +244,19 @@ class DefaultRunner(BaseRunner):
             cfg.train_config.training_params.val_every = 1
             cfg.train_config.training_params.sample_every = 1
 
+        if is_distributed and is_main:
+            log.info(f"Distributed training: world_size={world_size}")
+
         # training loop
         log_path = os.path.join(self.output_dir, "logs.json.txt")
         with JsonLogger(log_path) as json_logger:
             for local_epoch_idx in range(cfg.train_config.training_params.num_epochs):
                 step_log = dict()
+
+                # Reshuffle data partition each epoch for distributed training
+                if hasattr(train_dataloader, '_dist_sampler'):
+                    train_dataloader._dist_sampler.set_epoch(self.epoch)
+
                 # ========= train for this epoch ==========
                 if cfg.train_config.training_params.freeze_encoder:
                     self.model.obs_encoder.eval()
@@ -243,6 +268,7 @@ class DefaultRunner(BaseRunner):
                     desc=f"Training epoch {self.epoch}",
                     leave=False,
                     mininterval=cfg.train_config.training_params.tqdm_interval_sec,
+                    disable=not is_main,
                 ) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         batch = dataset.postprocess(batch, device)
@@ -250,27 +276,25 @@ class DefaultRunner(BaseRunner):
                             train_sampling_batch = batch
 
                         raw_loss = self.model.compute_loss(batch)
-                        loss = (
-                            raw_loss
-                            / cfg.train_config.training_params.gradient_accumulate_every
-                        )
+                        loss = raw_loss / grad_accum
                         loss.backward()
 
                         # step optimizer
-                        if (
-                            self.global_step
-                            % cfg.train_config.training_params.gradient_accumulate_every
-                            == 0
-                        ):
+                        if self.global_step % grad_accum == 0:
+                            # Synchronize gradients across ranks before stepping
+                            if is_distributed:
+                                for param in self.model.parameters():
+                                    if param.grad is not None:
+                                        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
 
-                        # update ema
+                        # update ema (all ranks keep identical EMA)
                         if cfg.train_config.training_params.use_ema:
                             ema.step(self.model)
 
-                        # logging
+                        # logging (rank 0 only)
                         raw_loss_cpu = raw_loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
@@ -283,10 +307,10 @@ class DefaultRunner(BaseRunner):
 
                         is_last_batch = batch_idx == (len(train_dataloader) - 1)
                         if not is_last_batch:
-                            # log of last step is combined with validation and rollout
-                            if wandb_run is not None:
-                                wandb_run.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
+                            if is_main:
+                                if wandb_run is not None:
+                                    wandb_run.log(step_log, step=self.global_step)
+                                json_logger.log(step_log)
                             self.global_step += 1
 
                         if (
@@ -297,158 +321,137 @@ class DefaultRunner(BaseRunner):
                             break
 
                 # at the end of each epoch
-                # replace train_loss with epoch average
                 train_loss = np.mean(train_losses)
                 step_log["train_loss"] = train_loss
 
-                # ========= eval for this epoch ==========
+                # ========= eval for this epoch (rank 0 only) ==========
                 policy = self.model
                 if cfg.train_config.training_params.use_ema:
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout
-                # if (self.epoch % cfg.train_config.training_params.rollout_every) == 0:
-                #     runner_log = env_runner.run(policy)
-                #     # log all
-                #     step_log.update(runner_log)
-
-                # run validation
-                if (self.epoch % cfg.train_config.training_params.val_every) == 0:
-                    with torch.no_grad():
-                        val_losses = list()
-                        with tqdm.tqdm(
-                            val_dataloader,
-                            desc=f"Validation epoch {self.epoch}",
-                            leave=False,
-                            mininterval=cfg.train_config.training_params.tqdm_interval_sec,
-                        ) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dataset.postprocess(batch, device)
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
-                                if (
-                                    cfg.train_config.training_params.max_val_steps
-                                    is not None
-                                ) and batch_idx >= (
-                                    cfg.train_config.training_params.max_val_steps - 1
-                                ):
-                                    break
-                        if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
-                            step_log["val_loss"] = val_loss
-
-                # Latent space visualization for A2A policy
-                if hasattr(policy, 'get_latents_for_visualization'):
-                    try:
+                if is_main:
+                    # run validation
+                    if (self.epoch % cfg.train_config.training_params.val_every) == 0:
                         with torch.no_grad():
-                            # Collect latents from multiple validation batches
-                            all_history_latents = []
-                            all_future_latents = []
-                            max_samples = 500  # Limit samples for t-SNE performance
-                            first_batch = None
-                            
-                            for batch_idx, batch in enumerate(val_dataloader):
-                                batch = dataset.postprocess(batch, device)
-                                if first_batch is None:
-                                    first_batch = batch  # Save for trajectory visualization
-                                history_latents, future_latents = policy.get_latents_for_visualization(batch)
-                                all_history_latents.append(history_latents.cpu())
-                                all_future_latents.append(future_latents.cpu())
-                                
-                                if sum(h.shape[0] for h in all_history_latents) >= max_samples:
-                                    break
-                            
-                            # Concatenate all collected latents
-                            history_latents = torch.cat(all_history_latents, dim=0)[:max_samples]
-                            future_latents = torch.cat(all_future_latents, dim=0)[:max_samples]
-                            
-                            # Get flow trajectories for visualization (uses model's num_sampling_steps)
-                            trajectories = None
-                            trajectory_targets = None
-                            if hasattr(policy, 'get_flow_trajectories') and first_batch is not None:
-                                trajectories, trajectory_targets = policy.get_flow_trajectories(
-                                    first_batch, n_samples=5
+                            val_losses = list()
+                            with tqdm.tqdm(
+                                val_dataloader,
+                                desc=f"Validation epoch {self.epoch}",
+                                leave=False,
+                                mininterval=cfg.train_config.training_params.tqdm_interval_sec,
+                            ) as tepoch:
+                                for batch_idx, batch in enumerate(tepoch):
+                                    batch = dataset.postprocess(batch, device)
+                                    loss = self.model.compute_loss(batch)
+                                    val_losses.append(loss)
+                                    if (
+                                        cfg.train_config.training_params.max_val_steps
+                                        is not None
+                                    ) and batch_idx >= (
+                                        cfg.train_config.training_params.max_val_steps - 1
+                                    ):
+                                        break
+                            if len(val_losses) > 0:
+                                val_loss = torch.mean(torch.tensor(val_losses)).item()
+                                step_log["val_loss"] = val_loss
+
+                    # Latent space visualization for A2A policy
+                    if hasattr(policy, 'get_latents_for_visualization'):
+                        try:
+                            with torch.no_grad():
+                                all_history_latents = []
+                                all_future_latents = []
+                                max_samples = 500
+                                first_batch = None
+
+                                for batch_idx, batch in enumerate(val_dataloader):
+                                    batch = dataset.postprocess(batch, device)
+                                    if first_batch is None:
+                                        first_batch = batch
+                                    history_latents, future_latents = policy.get_latents_for_visualization(batch)
+                                    all_history_latents.append(history_latents.cpu())
+                                    all_future_latents.append(future_latents.cpu())
+
+                                    if sum(h.shape[0] for h in all_history_latents) >= max_samples:
+                                        break
+
+                                history_latents = torch.cat(all_history_latents, dim=0)[:max_samples]
+                                future_latents = torch.cat(all_future_latents, dim=0)[:max_samples]
+
+                                trajectories = None
+                                trajectory_targets = None
+                                if hasattr(policy, 'get_flow_trajectories') and first_batch is not None:
+                                    trajectories, trajectory_targets = policy.get_flow_trajectories(
+                                        first_batch, n_samples=5
+                                    )
+
+                                viz_dir = pathlib.Path(self.output_dir) / "latent_viz"
+                                viz_results = plot_all_latent_visualizations(
+                                    history_latents=history_latents,
+                                    future_latents=future_latents,
+                                    epoch=self.epoch + 1,
+                                    save_dir=str(viz_dir),
+                                    trajectories=trajectories,
+                                    trajectory_targets=trajectory_targets,
                                 )
-                            
-                            # Generate all visualizations
-                            viz_dir = pathlib.Path(self.output_dir) / "latent_viz"
-                            viz_results = plot_all_latent_visualizations(
-                                history_latents=history_latents,
-                                future_latents=future_latents,
-                                epoch=self.epoch + 1,
-                                save_dir=str(viz_dir),
-                                trajectories=trajectories,
-                                trajectory_targets=trajectory_targets,
-                            )
-                            log.info(f"Saved latent visualizations to {viz_dir}")
-                            log.info(f"  Avg t-SNE Distance: {viz_results['avg_tsne_distance']:.2f}")
-                            
-                            # Log metrics to wandb
-                            wandb_metrics = {
-                                "latent/avg_tsne_distance": viz_results['avg_tsne_distance'],
-                            }
-                            if 'flow_end_to_target_dist' in viz_results:
-                                wandb_metrics["latent/flow_end_to_target_dist"] = viz_results['flow_end_to_target_dist']
-                            if wandb_run is not None:
-                                wandb_run.log(wandb_metrics, step=self.global_step)
-                    except Exception as e:
-                        log.warning(f"Failed to generate latent visualization: {e}")
+                                log.info(f"Saved latent visualizations to {viz_dir}")
+                                log.info(f"  Avg t-SNE Distance: {viz_results['avg_tsne_distance']:.2f}")
 
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.train_config.training_params.sample_every) == 0:
-                    with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
-                        batch = train_sampling_batch
-                        obs_dict = batch["obs"]
-                        gt_action = batch["action"]
+                                wandb_metrics = {
+                                    "latent/avg_tsne_distance": viz_results['avg_tsne_distance'],
+                                }
+                                if 'flow_end_to_target_dist' in viz_results:
+                                    wandb_metrics["latent/flow_end_to_target_dist"] = viz_results['flow_end_to_target_dist']
+                                if wandb_run is not None:
+                                    wandb_run.log(wandb_metrics, step=self.global_step)
+                        except Exception as e:
+                            log.warning(f"Failed to generate latent visualization: {e}")
 
-                        result = policy.predict_action(
-                            obs_dict,
-                            task_idx=batch.get("task_idx"),
+                    # run diffusion sampling on a training batch
+                    if (self.epoch % cfg.train_config.training_params.sample_every) == 0:
+                        with torch.no_grad():
+                            batch = train_sampling_batch
+                            obs_dict = batch["obs"]
+                            gt_action = batch["action"]
+
+                            result = policy.predict_action(obs_dict)
+                            pred_action = result["action_pred"]
+
+                            pred_len = pred_action.shape[1]
+                            gt_len = gt_action.shape[1]
+                            if pred_len != gt_len:
+                                n_obs_steps = gt_len - pred_len + 1
+                                start_idx = n_obs_steps - 1
+                                gt_action = gt_action[:, start_idx:start_idx + pred_len, :]
+
+                            mse = torch.nn.functional.mse_loss(pred_action, gt_action)
+                            step_log["train_action_mse_error"] = mse.item()
+                            del batch, obs_dict, gt_action, result, pred_action, mse
+
+                    # checkpoint (rank 0 only)
+                    if (
+                        (self.epoch + 1) % cfg.train_config.training_params.checkpoint_every
+                    ) == 0 or self.epoch + 1 >= cfg.train_config.training_params.num_epochs:
+                        self.save_checkpoint(
+                            cfg.checkpoint.save_root_dir
+                            + f"/checkpoints/{self.epoch + 1}.ckpt"
                         )
-                        pred_action = result["action_pred"]
-                        
-                        # Handle shape mismatch (e.g., VITA action-to-action flow outputs 8 frames from horizon=16)
-                        pred_len = pred_action.shape[1]
-                        gt_len = gt_action.shape[1]
-                        if pred_len != gt_len:
-                            # For action-to-action flow: pred is future actions starting from n_obs_steps-1
-                            # Slice gt_action to match: take the corresponding future portion
-                            n_obs_steps = gt_len - pred_len + 1  # Infer n_obs_steps from shape difference
-                            start_idx = n_obs_steps - 1
-                            gt_action = gt_action[:, start_idx:start_idx + pred_len, :]
-                        
-                        mse = torch.nn.functional.mse_loss(pred_action, gt_action)
-                        step_log["train_action_mse_error"] = mse.item()
-                        del batch
-                        del obs_dict
-                        del gt_action
-                        del result
-                        del pred_action
-                        del mse
-
-                # checkpoint
-                if (
-                    (self.epoch + 1) % cfg.train_config.training_params.checkpoint_every
-                ) == 0 or self.epoch + 1 >= cfg.train_config.training_params.num_epochs:
-                    # checkpointing
-                    self.save_checkpoint(
-                        cfg.checkpoint.save_root_dir
-                        + f"/checkpoints/{self.epoch + 1}.ckpt"
-                    )  # TODO
 
                 # ========= eval end for this epoch ==========
                 policy.train()
 
                 # end of epoch
-                # log of last step is combined with validation and rollout
-                json_logger.log(step_log)
-                if wandb_run is not None:
-                    wandb_run.log(step_log, step=self.global_step)
+                if is_main:
+                    json_logger.log(step_log)
+                    if wandb_run is not None:
+                        wandb_run.log(step_log, step=self.global_step)
                 self.global_step += 1
                 self.epoch += 1
+
+                # Synchronize all ranks before next epoch
+                if is_distributed:
+                    dist.barrier()
 
     def evaluate(self, ckpt_path=None):
         args = self.eval_args
@@ -800,17 +803,26 @@ class DefaultRunner(BaseRunner):
         eval=None,
         ckpt_path=None,
     ):
+        _, _, _, _, is_main = _get_dist_info()
         train = self.cfg.train_enable
         eval = self.cfg.eval_enable
         # Always use eval_path if provided (respects num_epochs setting)
         ckpt_path = self.cfg.eval_path
         if train:
             self.train()
-        if eval:
+        if eval and is_main:
             self.evaluate(ckpt_path=ckpt_path)
 
 
 class BatchSampler:
+    """Yields numpy arrays of batch indices.
+
+    Supports distributed training: when *world_size* > 1 each rank
+    receives a disjoint partition of the data.  Call :meth:`set_epoch`
+    before each epoch so that the shuffle is deterministic yet different
+    across epochs.
+    """
+
     def __init__(
         self,
         data_size: int,
@@ -818,25 +830,44 @@ class BatchSampler:
         shuffle: bool = False,
         seed: int = 0,
         drop_last: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         assert drop_last
         self.data_size = data_size
         self.batch_size = batch_size
-        self.num_batch = data_size // batch_size
-        self.discard = data_size - batch_size * self.num_batch
+        self.seed = seed
         self.shuffle = shuffle
-        self.rng = np.random.default_rng(seed) if shuffle else None
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+
+        # Each rank gets data_size // world_size samples
+        per_rank = data_size // world_size
+        self.per_rank_size = per_rank
+        self.num_batch = per_rank // batch_size
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for deterministic reshuffling across ranks."""
+        self.epoch = epoch
 
     def __iter__(self):
         if self.shuffle:
-            perm = self.rng.permutation(self.data_size)
+            # All ranks produce the same permutation (same seed + epoch)
+            rng = np.random.default_rng(self.seed + self.epoch)
+            perm = rng.permutation(self.data_size)
         else:
             perm = np.arange(self.data_size)
-        if self.discard > 0:
-            perm = perm[: -self.discard]
-        perm = perm.reshape(self.num_batch, self.batch_size)
+
+        # Split: rank k gets [k*per_rank : (k+1)*per_rank]
+        start = self.rank * self.per_rank_size
+        rank_perm = perm[start : start + self.per_rank_size]
+
+        # Trim to batch-aligned size and reshape
+        usable = self.num_batch * self.batch_size
+        rank_perm = rank_perm[:usable].reshape(self.num_batch, self.batch_size)
         for i in range(self.num_batch):
-            yield perm[i]
+            yield rank_perm[i]
 
     def __len__(self):
         return self.num_batch
@@ -851,10 +882,12 @@ def create_dataloader(
     pin_memory: bool,
     persistent_workers: bool,
     seed: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ):
-    # print("create_dataloader_batch_size", batch_size)
-    batch_sampler = BatchSampler(
-        len(dataset), batch_size, shuffle=shuffle, seed=seed, drop_last=True
+    sampler = BatchSampler(
+        len(dataset), batch_size, shuffle=shuffle, seed=seed, drop_last=True,
+        rank=rank, world_size=world_size,
     )
 
     def collate(x):
@@ -864,11 +897,13 @@ def create_dataloader(
     dataloader = DataLoader(
         dataset,
         collate_fn=collate,
-        sampler=batch_sampler,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=False,
         persistent_workers=persistent_workers,
     )
+    # Stash sampler for set_epoch() calls in the training loop
+    dataloader._dist_sampler = sampler
     return dataloader
 
 

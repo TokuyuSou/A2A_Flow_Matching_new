@@ -28,6 +28,7 @@ eval_task=""         # Task to evaluate on (default: first task in task_name_set
 num_epochs=200
 seed=42
 gpu=0
+num_gpus=1           # Number of GPUs (>1 enables distributed training via torchrun)
 obs_space=joint_pos
 act_space=joint_pos
 delta_ee=0
@@ -85,11 +86,15 @@ while [[ $# -gt 0 ]]; do
             gpu="$2"
             shift 2
             ;;
+        --num_gpus)
+            num_gpus="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown parameter: $1"
             echo "Optional parameters: --task_name_set --policy_name --sim_set --demo_num"
             echo "                     --train_enable --eval_enable --eval_task"
-            echo "                     --num_epochs --gpu --dr_level_collect --dr_level_eval"
+            echo "                     --num_epochs --gpu --num_gpus --dr_level_collect --dr_level_eval"
             exit 1
             ;;
     esac
@@ -133,6 +138,13 @@ fi
 # Run training/evaluation for DP/FM/VITA/A2A policies
 echo "=== Running ${policy_name} on task(s): ${task_name_set} ==="
 
+# Launcher: use torchrun for multi-GPU, plain python for single-GPU
+if [ "${num_gpus}" -gt 1 ]; then
+    LAUNCHER="torchrun --nproc_per_node=${num_gpus}"
+else
+    LAUNCHER="python"
+fi
+
 eval_ckpt_name=$num_epochs
 output_dir="./il_outputs/${policy_name}"
 eval_path="${output_dir}/${combined_task_name}/checkpoints/${eval_ckpt_name}.ckpt"
@@ -150,7 +162,7 @@ if [ "${num_tasks}" -eq 1 ]; then
     # ---- Single-task training (original behaviour) ----
     zarr_path="./data_policy/${task_name_set}FrankaL${dr_level_collect}_${extra}_${demo_num}.zarr"
 
-    python ${main_script} --config-name=${config_name}.yaml \
+    ${LAUNCHER} ${main_script} --config-name=${config_name}.yaml \
     task_name=${combined_task_name} \
     "dataset_config.zarr_path=${zarr_path}" \
     train_config.training_params.seed=${seed} \
@@ -192,7 +204,7 @@ else
         fi
     done
 
-    python ${main_script} --config-name=${config_name}.yaml \
+    ${LAUNCHER} ${main_script} --config-name=${config_name}.yaml \
     dataset_config=multi_task_robot_image_dataset \
     task_name=${combined_task_name} \
     "dataset_config.zarr_paths=[${zarr_paths_list}]" \
