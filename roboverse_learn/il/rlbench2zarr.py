@@ -29,8 +29,6 @@ Zarr output layout
 import argparse
 import os
 import pickle
-import shutil
-
 import numpy as np
 import zarr
 from PIL import Image
@@ -156,13 +154,15 @@ def main():
     print(f"Task: {args.task_name}, Variation: {args.variation}")
     print(f"Found {num_demos} episodes in {episodes_dir}")
 
-    # Prepare output zarr
-    save_path = os.path.join(
-        args.output_dir,
-        f"{args.task_name}_rlbench_v{args.variation}_{num_demos}.zarr"
-    )
+    # Prepare output zarr (auto-increment version if path already exists)
+    base_name = f"{args.task_name}_rlbench_v{args.variation}_{num_demos}"
+    save_path = os.path.join(args.output_dir, f"{base_name}.zarr")
     if os.path.exists(save_path):
-        shutil.rmtree(save_path)
+        version = 2
+        while os.path.exists(os.path.join(args.output_dir, f"{base_name}_ver{version}.zarr")):
+            version += 1
+        save_path = os.path.join(args.output_dir, f"{base_name}_ver{version}.zarr")
+        print(f"Output already exists. Saving as version {version}: {save_path}")
 
     zarr_root = zarr.group(save_path)
     zarr_data = zarr_root.create_group("data")

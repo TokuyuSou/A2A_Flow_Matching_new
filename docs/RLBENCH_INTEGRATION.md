@@ -317,7 +317,7 @@ bash roboverse_learn/il/rlbench_run.sh \
     --dataset_root rlbench_dataset \
     --num_demos 100 \
     --num_epochs 200 \
-    --gpu 0
+    --gpus 0
 ```
 
 | パラメータ | デフォルト | 説明 |
@@ -326,8 +326,7 @@ bash roboverse_learn/il/rlbench_run.sh \
 | `--dataset_root` | (必須) | RLBench データセットのルート |
 | `--num_demos` | `100` | 使用するデモ数 |
 | `--num_epochs` | `200` | 訓練エポック数 |
-| `--gpu` | `0` | ベース GPU デバイス番号 |
-| `--num_gpus` | `1` | 使用 GPU 数（2 以上で `torchrun` による分散訓練） |
+| `--gpus` | `0` | 使用 GPU ID（カンマ区切りで複数指定、例: `0,1,2,3`） |
 | `--camera` | `front` | 使用カメラ |
 | `--train_enable` | `True` | 訓練の有効/無効 |
 | `--eval_enable` | `True` | 評価の有効/無効 |
@@ -335,7 +334,7 @@ bash roboverse_learn/il/rlbench_run.sh \
 
 ### マルチ GPU 訓練
 
-`--num_gpus` に 2 以上を指定すると、`torchrun --nproc_per_node=N` による分散訓練に自動で切り替わります。
+`--gpus` にカンマ区切りで複数の GPU ID を指定すると、`torchrun --nproc_per_node=N` による分散訓練に自動で切り替わります。
 
 ```bash
 bash roboverse_learn/il/rlbench_run.sh \
@@ -343,11 +342,11 @@ bash roboverse_learn/il/rlbench_run.sh \
     --dataset_root rlbench_dataset \
     --num_demos 100 \
     --num_epochs 200 \
-    --num_gpus 4
+    --gpus 0,1,2,3
 ```
 
-> `--num_gpus 1`（デフォルト）の場合は通常の `python` ランチャーでシングル GPU 訓練になります。
-> マルチ GPU 時は各プロセスのデバイスが `LOCAL_RANK` で自動決定されるため、`--gpu` は無視されます。
+> `--gpus 0`（デフォルト、GPU 1台）の場合は通常の `python` ランチャーでシングル GPU 訓練になります。
+> マルチ GPU 時は `CUDA_VISIBLE_DEVICES` が自動設定され、各プロセスのデバイスが `LOCAL_RANK` で自動決定されます。
 
 訓練のみ（CoppeliaSim 不要）:
 
