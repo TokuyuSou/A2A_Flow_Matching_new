@@ -27,8 +27,7 @@ eval_task=""         # Task to evaluate on (default: first task in task_name_set
 # Training parameters
 num_epochs=200
 seed=42
-gpu=0
-num_gpus=1           # Number of GPUs (>1 enables distributed training via torchrun)
+gpus=0               # GPU IDs (e.g. 0 or 0,1,2 for multi-GPU)
 obs_space=joint_pos
 act_space=joint_pos
 delta_ee=0
@@ -82,19 +81,15 @@ while [[ $# -gt 0 ]]; do
             num_epochs="$2"
             shift 2
             ;;
-        --gpu)
-            gpu="$2"
-            shift 2
-            ;;
-        --num_gpus)
-            num_gpus="$2"
+        --gpus)
+            gpus="$2"
             shift 2
             ;;
         *)
             echo "Unknown parameter: $1"
             echo "Optional parameters: --task_name_set --policy_name --sim_set --demo_num"
             echo "                     --train_enable --eval_enable --eval_task"
-            echo "                     --num_epochs --gpu --num_gpus --dr_level_collect --dr_level_eval"
+            echo "                     --num_epochs --gpus --dr_level_collect --dr_level_eval"
             exit 1
             ;;
     esac
@@ -138,6 +133,11 @@ fi
 # Run training/evaluation for DP/FM/VITA/A2A policies
 echo "=== Running ${policy_name} on task(s): ${task_name_set} ==="
 
+# Derive num_gpus from comma-separated gpus list
+IFS=',' read -ra gpu_array <<< "${gpus}"
+num_gpus=${#gpu_array[@]}
+export CUDA_VISIBLE_DEVICES=${gpus}
+
 # Launcher: use torchrun for multi-GPU, plain python for single-GPU
 if [ "${num_gpus}" -gt 1 ]; then
     LAUNCHER="torchrun --nproc_per_node=${num_gpus}"
@@ -167,7 +167,7 @@ if [ "${num_tasks}" -eq 1 ]; then
     "dataset_config.zarr_path=${zarr_path}" \
     train_config.training_params.seed=${seed} \
     train_config.training_params.num_epochs=${num_epochs} \
-    train_config.training_params.device=${gpu} \
+    train_config.training_params.device=cuda:0 \
     eval_config.policy_runner.obs.obs_type=${obs_space} \
     eval_config.policy_runner.action.action_type=${act_space} \
     eval_config.policy_runner.action.delta=${delta_ee} \
@@ -211,7 +211,7 @@ else
     "+policy_config.task_descriptions={${task_descs_entries}}" \
     train_config.training_params.seed=${seed} \
     train_config.training_params.num_epochs=${num_epochs} \
-    train_config.training_params.device=${gpu} \
+    train_config.training_params.device=cuda:0 \
     eval_config.policy_runner.obs.obs_type=${obs_space} \
     eval_config.policy_runner.action.action_type=${act_space} \
     eval_config.policy_runner.action.delta=${delta_ee} \

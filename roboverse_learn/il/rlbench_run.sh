@@ -31,8 +31,7 @@ train_enable=True
 eval_enable=True
 num_epochs=200
 seed=42
-gpu=0
-num_gpus=1            # Number of GPUs (>1 enables distributed training via torchrun)
+gpus=0                # GPU IDs (e.g. 0 or 0,1,2 for multi-GPU)
 
 # Eval control
 eval_num_episodes=25
@@ -53,8 +52,7 @@ while [[ $# -gt 0 ]]; do
         --train_enable)     train_enable="$2"; shift 2 ;;
         --eval_enable)      eval_enable="$2"; shift 2 ;;
         --num_epochs)       num_epochs="$2"; shift 2 ;;
-        --gpu)              gpu="$2"; shift 2 ;;
-        --num_gpus)         num_gpus="$2"; shift 2 ;;
+        --gpus)             gpus="$2"; shift 2 ;;
         --eval_num_episodes) eval_num_episodes="$2"; shift 2 ;;
         --eval_max_steps)   eval_max_steps="$2"; shift 2 ;;
         --eval_num_workers) eval_num_workers="$2"; shift 2 ;;
@@ -126,6 +124,11 @@ eval_path="${output_dir}/${combined_name}/checkpoints/${num_epochs}.ckpt"
 
 export policy_name="${policy_name}"
 
+# Derive num_gpus from comma-separated gpus list
+IFS=',' read -ra gpu_array <<< "${gpus}"
+num_gpus=${#gpu_array[@]}
+export CUDA_VISIBLE_DEVICES=${gpus}
+
 if [ "${train_enable}" = "True" ]; then
     echo ""
     echo "=== Step 2: Training ${policy_name} on ${task_name} ==="
@@ -145,7 +148,7 @@ if [ "${train_enable}" = "True" ]; then
             "dataset_config.zarr_path=${zarr_path}" \
             train_config.training_params.seed=${seed} \
             train_config.training_params.num_epochs=${num_epochs} \
-            train_config.training_params.device=${gpu} \
+            train_config.training_params.device=cuda:0 \
             eval_config.policy_runner.obs.obs_type=joint_pos \
             eval_config.policy_runner.action.action_type=joint_pos \
             eval_config.policy_runner.action.delta=0 \
@@ -171,7 +174,7 @@ if [ "${train_enable}" = "True" ]; then
             "+policy_config.task_descriptions={${task_descs_entries}}" \
             train_config.training_params.seed=${seed} \
             train_config.training_params.num_epochs=${num_epochs} \
-            train_config.training_params.device=${gpu} \
+            train_config.training_params.device=cuda:0 \
             eval_config.policy_runner.obs.obs_type=joint_pos \
             eval_config.policy_runner.action.action_type=joint_pos \
             eval_config.policy_runner.action.delta=0 \
@@ -214,7 +217,7 @@ if [ "${eval_enable}" = "True" ]; then
             --camera "${camera}" \
             --image_size "${image_size}" \
             --variation "${variation}" \
-            --device "cuda:${gpu}" \
+            --device "cuda:0" \
             --dataset_root "${dataset_root}" \
             --num_workers "${eval_num_workers}" \
             --eval_dir "${eval_dir}" \
