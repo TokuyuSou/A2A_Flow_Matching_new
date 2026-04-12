@@ -53,8 +53,13 @@ def parse_args():
         help="Path to single-task zarr dataset",
     )
     p.add_argument(
-        "--output_dir", type=str, required=True,
-        help="Directory to save adapter checkpoints",
+        "--output_dir", type=str, default=None,
+        help="Directory to save adapter checkpoints "
+             "(default: lora_adapters/{task_name}/{timestamp})",
+    )
+    p.add_argument(
+        "--overwrite", action="store_true",
+        help="Allow writing into an existing output directory",
     )
 
     # LoRA ranks
@@ -145,6 +150,26 @@ def create_dataset(data_dir: str, cfg, val_ratio: float = 0.02):
 
 def main():
     args = parse_args()
+
+    # --- Resolve output_dir ---
+    if args.output_dir is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = os.path.join(
+            "lora_adapters", args.task_name, timestamp,
+        )
+
+    if os.path.exists(args.output_dir) and not args.overwrite:
+        # Allow empty dirs (e.g. just created by a previous mkdir).
+        if any(True for _ in os.scandir(args.output_dir)):
+            print(
+                f"ERROR: Output directory already exists and is not empty:\n"
+                f"  {args.output_dir}\n"
+                f"Use --overwrite to force, or omit --output_dir for an "
+                f"auto-generated timestamped path."
+            )
+            sys.exit(1)
+
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
 

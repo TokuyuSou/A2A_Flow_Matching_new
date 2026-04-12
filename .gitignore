@@ -78,6 +78,7 @@ IsaacLab
 *.log
 _data
 *.ipynb
+*.txt
 
 *.avi
 *.mp4
