@@ -167,6 +167,12 @@ def run_episodes(worker_id, episode_ids, task_name, eval_dir, args, result_queue
 
     policy, cfg, n_obs_steps, n_action_steps = load_policy(args.checkpoint, str(device))
 
+    # Seed each worker uniquely AFTER load_policy(), because
+    # DefaultRunner.__init__ resets np.random.seed to a fixed config value.
+    seed = args.seed + worker_id
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     # Set task embedding for evaluation (multi-task models)
     if hasattr(policy, 'set_eval_task'):
         policy.set_eval_task(task_name)
@@ -307,6 +313,7 @@ def main():
                              "Defaults to <checkpoint_dir>/../eval.")
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Number of parallel CoppeliaSim workers.")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     task_list = args.task_name.split('+')

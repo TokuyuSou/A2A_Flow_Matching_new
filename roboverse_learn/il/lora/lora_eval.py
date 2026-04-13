@@ -71,6 +71,12 @@ def run_episodes(worker_id, episode_ids, task_name, eval_dir, args, result_queue
     )
     adapter.eval()
 
+    # Seed each worker uniquely AFTER load_policy(), because
+    # DefaultRunner.__init__ resets np.random.seed to a fixed config value.
+    seed = args.seed + worker_id
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     # Set task embedding for evaluation.
     if adapter._task_idx is not None:
         base_policy.set_eval_task(task_name)
@@ -224,6 +230,7 @@ def main():
     parser.add_argument("--dataset_root", type=str, default="")
     parser.add_argument("--eval_dir", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     if args.eval_dir is None:
