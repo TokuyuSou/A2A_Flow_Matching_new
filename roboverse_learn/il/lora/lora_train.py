@@ -18,6 +18,7 @@ Usage
 
 import argparse
 import os
+import pathlib
 import sys
 
 import dill
@@ -29,6 +30,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from roboverse_learn.il.lora.lora_modules import A2ALoRAAdapter
+from roboverse_learn.il.utils.visualization import plot_all_latent_visualizations
 
 
 # ----------------------------------------------------------------------- #
@@ -62,11 +64,25 @@ def parse_args():
         help="Allow writing into an existing output directory",
     )
 
-    # LoRA ranks
+    # LoRA ranks (existing targets)
     p.add_argument("--flow_mlp_rank", type=int, default=8)
     p.add_argument("--decoder_rank", type=int, default=4)
     p.add_argument("--task_rank", type=int, default=4)
     p.add_argument("--out_proj_rank", type=int, default=4)
+    # LoRA ranks (extended targets, 0 = skip)
+    p.add_argument("--obs_proj_rank", type=int, default=0,
+                    help="Rank for obs_projector (0 = skip)")
+    p.add_argument("--enc_proj_rank", type=int, default=0,
+                    help="Rank for action encoder latent_proj (0 = skip)")
+    p.add_argument("--flow_input_rank", type=int, default=0,
+                    help="Rank for flow_net input_proj & cond_embed (0 = skip)")
+    p.add_argument("--dec_input_rank", type=int, default=0,
+                    help="Rank for action_decoder input_proj (0 = skip)")
+    # LoRA variants
+    p.add_argument("--use_rslora", action="store_true",
+                    help="Use rank-stabilized scaling (alpha/sqrt(r) instead of alpha/r)")
+    p.add_argument("--use_dora", action="store_true",
+                    help="Use DoRA (Weight-Decomposed Low-Rank Adaptation)")
 
     # Training hyper-parameters
     p.add_argument("--num_epochs", type=int, default=80)
@@ -185,6 +201,12 @@ def main():
         decoder_rank=args.decoder_rank,
         task_rank=args.task_rank,
         out_proj_rank=args.out_proj_rank,
+        obs_proj_rank=args.obs_proj_rank,
+        enc_proj_rank=args.enc_proj_rank,
+        flow_input_rank=args.flow_input_rank,
+        dec_input_rank=args.dec_input_rank,
+        use_rslora=args.use_rslora,
+        use_dora=args.use_dora,
     )
     adapter.to(args.device)
     print(adapter.param_summary())
@@ -196,8 +218,9 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
         pin_memory=True,
+        persistent_workers=True,
     )
     val_dataloader = None
     if val_dataset is not None and len(val_dataset) > 0:
@@ -205,8 +228,9 @@ def main():
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=4,
             pin_memory=True,
+            persistent_workers=True,
         )
     print(f"Dataset: {len(dataset)} train samples, {len(dataloader)} batches/epoch")
     if val_dataloader is not None:
@@ -238,11 +262,17 @@ def main():
                 "decoder_rank": args.decoder_rank,
                 "task_rank": args.task_rank,
                 "out_proj_rank": args.out_proj_rank,
+                "obs_proj_rank": args.obs_proj_rank,
+                "enc_proj_rank": args.enc_proj_rank,
+                "flow_input_rank": args.flow_input_rank,
+                "dec_input_rank": args.dec_input_rank,
                 "num_epochs": args.num_epochs,
                 "lr": args.lr,
                 "batch_size": args.batch_size,
                 "grad_clip": args.grad_clip,
                 "seed": args.seed,
+                "use_rslora": args.use_rslora,
+                "use_dora": args.use_dora,
                 "trainable_params": adapter.num_trainable_params(),
                 "output_dir": args.output_dir,
             },
@@ -312,6 +342,71 @@ def main():
                         break
             if val_losses:
                 val_loss = sum(val_losses) / len(val_losses)
+
+            # --- Latent space visualization ---
+            if hasattr(base_policy, 'get_latents_for_visualization'):
+                try:
+                    with torch.no_grad():
+                        all_history_latents = []
+                        all_future_latents = []
+                        max_samples = 500
+                        first_batch = None
+
+                        for raw_viz_batch in val_dataloader:
+                            viz_batch = val_dataset.postprocess(raw_viz_batch, args.device)
+                            if (
+                                getattr(adapter, "_task_idx", None) is not None
+                                and "task_idx" not in viz_batch
+                            ):
+                                B, T = viz_batch["action"].shape[:2]
+                                viz_batch = {
+                                    **viz_batch,
+                                    "task_idx": torch.full(
+                                        (B, T),
+                                        adapter._task_idx,
+                                        dtype=torch.long,
+                                        device=viz_batch["action"].device,
+                                    ),
+                                }
+                            if first_batch is None:
+                                first_batch = viz_batch
+                            h_lat, f_lat = base_policy.get_latents_for_visualization(viz_batch)
+                            all_history_latents.append(h_lat.cpu())
+                            all_future_latents.append(f_lat.cpu())
+                            if sum(h.shape[0] for h in all_history_latents) >= max_samples:
+                                break
+
+                        history_latents = torch.cat(all_history_latents, dim=0)[:max_samples]
+                        future_latents = torch.cat(all_future_latents, dim=0)[:max_samples]
+
+                        trajectories = None
+                        trajectory_targets = None
+                        if hasattr(base_policy, 'get_flow_trajectories') and first_batch is not None:
+                            trajectories, trajectory_targets = base_policy.get_flow_trajectories(
+                                first_batch, n_samples=5,
+                            )
+
+                        viz_dir = pathlib.Path(args.output_dir) / "latent_viz"
+                        viz_results = plot_all_latent_visualizations(
+                            history_latents=history_latents,
+                            future_latents=future_latents,
+                            epoch=epoch,
+                            save_dir=str(viz_dir),
+                            trajectories=trajectories,
+                            trajectory_targets=trajectory_targets,
+                        )
+                        print(f"  Latent viz saved to {viz_dir}  "
+                              f"avg_tsne_dist={viz_results['avg_tsne_distance']:.2f}")
+
+                        if wandb_run is not None:
+                            latent_metrics = {
+                                "latent/avg_tsne_distance": viz_results['avg_tsne_distance'],
+                            }
+                            if 'flow_end_to_target_dist' in viz_results:
+                                latent_metrics["latent/flow_end_to_target_dist"] = viz_results['flow_end_to_target_dist']
+                            wandb_run.log(latent_metrics, step=global_step)
+                except Exception as e:
+                    print(f"  Warning: latent visualization failed: {e}")
 
         # --- Print ---
         line = (

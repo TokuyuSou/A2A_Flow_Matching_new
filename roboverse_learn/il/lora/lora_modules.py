@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -26,16 +27,21 @@ import torch.nn as nn
 class LoRALinear(nn.Module):
     """Wraps a frozen ``nn.Linear`` with a trainable low-rank residual.
 
-    ``forward(x) = base_linear(x) + (x @ A @ B) * (alpha / rank)``
+    Supports three modes controlled by ``use_dora``:
 
-    * ``base_linear`` is stored via ``object.__setattr__`` so it is **not**
-      registered as a submodule — ``state_dict()`` contains only ``lora_A``
-      and ``lora_B``.
-    * ``lora_B`` is zero-initialised, so the initial output is identical
-      to the base layer.
+    * **LoRA** (default): ``out = W0·x + (x @ A @ B) · s``
+    * **DoRA** (Liu et al., 2024): decomposes into magnitude and direction.
+      ``V = W0 + B^T A^T · s``,  ``out = (m / ‖V‖_row) · V · x``
+      where *m* is a learnable per-output-neuron magnitude vector and the
+      row-wise norm is **detached** for gradient stability (§4.3 of the paper).
+
+    ``base_linear`` is stored via ``object.__setattr__`` so it is **not**
+    registered as a submodule — ``state_dict()`` contains only the LoRA /
+    DoRA parameters, not the frozen base weights.
     """
 
-    def __init__(self, base_linear: nn.Linear, rank: int, alpha: float = None):
+    def __init__(self, base_linear: nn.Linear, rank: int, alpha: float = None,
+                 use_rslora: bool = False, use_dora: bool = False):
         super().__init__()
         in_features = base_linear.in_features
         out_features = base_linear.out_features
@@ -45,14 +51,47 @@ class LoRALinear(nn.Module):
 
         self.rank = rank
         self.alpha = alpha if alpha is not None else float(rank)
-        self.scaling = self.alpha / self.rank
+        if use_rslora:
+            self.scaling = self.alpha / math.sqrt(self.rank)
+        else:
+            self.scaling = self.alpha / self.rank
 
         self.lora_A = nn.Parameter(torch.empty(in_features, rank))
         self.lora_B = nn.Parameter(torch.zeros(rank, out_features))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
+        # DoRA: learnable magnitude vector, initialised to ‖W0‖_row.
+        self.use_dora = use_dora
+        if use_dora:
+            with torch.no_grad():
+                magnitude = torch.linalg.norm(base_linear.weight.detach(), dim=1)
+            self.magnitude = nn.Parameter(magnitude)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._base_linear(x) + (x @ self.lora_A @ self.lora_B) * self.scaling
+        base_out = self._base_linear(x)
+        lora_out = (x @ self.lora_A @ self.lora_B) * self.scaling
+
+        if not self.use_dora:
+            return base_out + lora_out
+
+        # DoRA: efficient decomposition (NVlabs, §4.3)
+        #   result = (m/‖V‖ - 1)·base_out + (m/‖V‖)·lora_out
+        # where V = W0 + B^T A^T · s,  ‖V‖ is per-row L2 norm (detached).
+        weight = self._base_linear.weight                       # (out, in)
+        # Detach lora_weight *before* norm computation to avoid building
+        # an unnecessary computation graph (matches HuggingFace PEFT).
+        lora_weight = (self.lora_B.T @ self.lora_A.T).detach() * self.scaling  # (out, in)
+        norm_v = torch.linalg.norm(weight + lora_weight, dim=1).detach()  # (out,)
+        mag_scale = (self.magnitude / norm_v).view(1, -1)       # (1, out)
+
+        bias = self._base_linear.bias
+        if bias is not None:
+            bias_shape = (1,) * (base_out.dim() - 1) + (-1,)
+            base_wo_bias = base_out - bias.view(*bias_shape)
+        else:
+            base_wo_bias = base_out
+
+        return base_out + (mag_scale - 1) * base_wo_bias + mag_scale * lora_out
 
     # Expose base layer properties for introspection.
     @property
@@ -64,9 +103,10 @@ class LoRALinear(nn.Module):
         return self._base_linear.out_features
 
     def extra_repr(self) -> str:
+        mode = "dora" if self.use_dora else "lora"
         return (
             f"in={self.in_features}, out={self.out_features}, "
-            f"rank={self.rank}, alpha={self.alpha}"
+            f"rank={self.rank}, alpha={self.alpha}, mode={mode}"
         )
 
 
@@ -106,6 +146,14 @@ class A2ALoRAAdapter(nn.Module):
         ``task_names`` for multi-task models).
     flow_mlp_rank, decoder_rank, task_rank, out_proj_rank : int
         LoRA ranks for the respective groups of layers.
+    obs_proj_rank : int
+        Rank for ``obs_projector`` (visual features → latent).  0 = skip.
+    enc_proj_rank : int
+        Rank for ``latent_proj`` in both action encoders.  0 = skip.
+    flow_input_rank : int
+        Rank for ``input_proj`` and ``cond_embed`` in the flow net.  0 = skip.
+    dec_input_rank : int
+        Rank for ``input_proj`` in the action decoder.  0 = skip.
     """
 
     def __init__(
@@ -116,14 +164,28 @@ class A2ALoRAAdapter(nn.Module):
         decoder_rank: int = 4,
         task_rank: int = 4,
         out_proj_rank: int = 4,
+        obs_proj_rank: int = 0,
+        enc_proj_rank: int = 0,
+        flow_input_rank: int = 0,
+        dec_input_rank: int = 0,
+        use_rslora: bool = False,
+        use_dora: bool = False,
     ):
         super().__init__()
         self.task_name = task_name
+        self._use_rslora = use_rslora
+        self._use_dora = use_dora
         self._config = dict(
             flow_mlp_rank=flow_mlp_rank,
             decoder_rank=decoder_rank,
             task_rank=task_rank,
             out_proj_rank=out_proj_rank,
+            obs_proj_rank=obs_proj_rank,
+            enc_proj_rank=enc_proj_rank,
+            flow_input_rank=flow_input_rank,
+            dec_input_rank=dec_input_rank,
+            use_rslora=use_rslora,
+            use_dora=use_dora,
         )
 
         # --- Resolve task index for multi-task models ---
@@ -146,6 +208,16 @@ class A2ALoRAAdapter(nn.Module):
         # --- Inject LoRA: FlowNet ---
         self.flow_loras = nn.ModuleList()
 
+        # input_proj / cond_embed (bridges into flow hidden space)
+        if flow_input_rank > 0:
+            self.flow_loras.append(
+                self._inject(base_policy.flow_net, "input_proj", flow_input_rank)
+            )
+            if base_policy.flow_net.cond_embed is not None:
+                self.flow_loras.append(
+                    self._inject(base_policy.flow_net, "cond_embed", flow_input_rank)
+                )
+
         for layer in base_policy.flow_net.layers:
             # MLP fc1 / fc2
             self.flow_loras.append(self._inject(layer.mlp, "fc1", flow_mlp_rank))
@@ -167,8 +239,16 @@ class A2ALoRAAdapter(nn.Module):
             self._inject(base_policy.flow_net, "out_proj", out_proj_rank)
         )
 
-        # --- Inject LoRA: ActionDecoder (last 2 layers + output_proj) ---
+        # --- Inject LoRA: ActionDecoder ---
         self.dec_loras = nn.ModuleList()
+
+        # input_proj (latent → decoder hidden)
+        if dec_input_rank > 0:
+            self.dec_loras.append(
+                self._inject(base_policy.action_decoder, "input_proj", dec_input_rank)
+            )
+
+        # last 2 MLP layers + output_proj
         dec_layers = base_policy.action_decoder.layers
         n_dec = len(dec_layers)
         for layer in dec_layers[max(0, n_dec - 2) :]:
@@ -177,6 +257,26 @@ class A2ALoRAAdapter(nn.Module):
         self.dec_loras.append(
             self._inject(base_policy.action_decoder, "output_proj", decoder_rank)
         )
+
+        # --- Inject LoRA: obs_projector & action encoders ---
+        self.proj_loras = nn.ModuleList()
+
+        # obs_projector (visual features → latent)
+        if obs_proj_rank > 0:
+            self.proj_loras.append(
+                self._inject(base_policy, "obs_projector", obs_proj_rank)
+            )
+
+        # action_encoder / history_action_encoder latent_proj
+        if enc_proj_rank > 0:
+            self.proj_loras.append(
+                self._inject(base_policy.action_encoder, "latent_proj", enc_proj_rank)
+            )
+            self.proj_loras.append(
+                self._inject(
+                    base_policy.history_action_encoder, "latent_proj", enc_proj_rank,
+                )
+            )
 
     # ------------------------------------------------------------------ #
     #  Injection helpers                                                  #
@@ -189,7 +289,8 @@ class A2ALoRAAdapter(nn.Module):
             f"Expected nn.Linear at {type(parent).__name__}.{attr_name}, "
             f"got {type(original).__name__}"
         )
-        lora = LoRALinear(original, rank=rank)
+        lora = LoRALinear(original, rank=rank,
+                         use_rslora=self._use_rslora, use_dora=self._use_dora)
         self._injection_records.append((parent, attr_name, original))
         setattr(parent, attr_name, lora)
         return lora
@@ -248,6 +349,7 @@ class A2ALoRAAdapter(nn.Module):
             f"A2ALoRAAdapter(task={self.task_name!r}, "
             f"flow_loras={len(self.flow_loras)}, "
             f"dec_loras={len(self.dec_loras)}, "
+            f"proj_loras={len(self.proj_loras)}, "
             f"trainable_params={n:,})"
         )
 
