@@ -18,6 +18,15 @@ Single GPU::
         --output_dir ./delta_adapters/close_box \
         --num_epochs 80
 
+Multiple datasets (concatenated)::
+
+    python roboverse_learn/il/delta/delta_train.py \
+        --base_checkpoint ./il_outputs/a2a/multi_task/checkpoints/200.ckpt \
+        --task_name close_box \
+        --data_dir ./data_policy/close_box_v0_100.zarr ./data_policy/close_box_v1_50.zarr \
+        --output_dir ./delta_adapters/close_box \
+        --num_epochs 80
+
 Multi-GPU (e.g. 4 GPUs)::
 
     torchrun --nproc_per_node=4 roboverse_learn/il/delta/delta_train.py \
@@ -165,8 +174,9 @@ def parse_args():
                     help="Path to Phase-1 base checkpoint (.ckpt)")
     p.add_argument("--task_name", type=str, required=True,
                     help="Task name (must exist in base checkpoint's task_names)")
-    p.add_argument("--data_dir", type=str, required=True,
-                    help="Path to single-task zarr dataset")
+    p.add_argument("--data_dir", type=str, nargs="+", required=True,
+                    help="Path(s) to single-task zarr dataset(s). "
+                         "Multiple paths are concatenated for training.")
     p.add_argument("--output_dir", type=str, default=None,
                     help="Directory to save adapter checkpoints "
                          "(default: delta_adapters/{task_name}/{timestamp})")
@@ -237,19 +247,42 @@ def load_base_policy(checkpoint_path: str, device: str):
     return policy, cfg
 
 
-def create_dataset(data_dir: str, cfg, val_ratio: float = 0.02, batch_size: int = 32):
-    """Create a single-task dataset matching Phase 1."""
-    from roboverse_learn.il.datasets.robot_image_dataset import RobotImageDataset
+def create_dataset(data_dirs, cfg, val_ratio: float = 0.02, batch_size: int = 32):
+    """Create a single-task dataset matching Phase 1.
 
-    dataset = RobotImageDataset(
-        zarr_path=data_dir,
-        horizon=cfg.horizon,
-        pad_before=cfg.n_obs_steps - 1,
-        pad_after=cfg.n_action_steps - 1,
-        seed=42,
-        val_ratio=val_ratio,
-        batch_size=batch_size,
-    )
+    Parameters
+    ----------
+    data_dirs : str or list[str]
+        One or more zarr dataset paths.  When multiple paths are given the
+        underlying replay buffers are merged into a single dataset via
+        ``MultiTaskRobotImageDataset``.
+    """
+    if isinstance(data_dirs, str):
+        data_dirs = [data_dirs]
+
+    if len(data_dirs) == 1:
+        from roboverse_learn.il.datasets.robot_image_dataset import RobotImageDataset
+        dataset = RobotImageDataset(
+            zarr_path=data_dirs[0],
+            horizon=cfg.horizon,
+            pad_before=cfg.n_obs_steps - 1,
+            pad_after=cfg.n_action_steps - 1,
+            seed=42,
+            val_ratio=val_ratio,
+            batch_size=batch_size,
+        )
+    else:
+        from roboverse_learn.il.datasets.robot_image_dataset import MultiTaskRobotImageDataset
+        dataset = MultiTaskRobotImageDataset(
+            zarr_paths=data_dirs,
+            horizon=cfg.horizon,
+            pad_before=cfg.n_obs_steps - 1,
+            pad_after=cfg.n_action_steps - 1,
+            seed=42,
+            val_ratio=val_ratio,
+            batch_size=batch_size,
+        )
+
     val_dataset = dataset.get_validation_dataset() if val_ratio > 0 else None
     return dataset, val_dataset
 
@@ -303,28 +336,49 @@ def reinit_scales_from_delta(adapter):
 
 
 class _BypassQuantization:
-    """Context manager that makes QuantizedDeltaLinear use float delta."""
+    """Context manager that makes QuantizedDeltaLinear/Conv1d use float delta."""
 
     def __init__(self, adapter):
         self._adapter = adapter
 
     def __enter__(self):
-        from roboverse_learn.il.delta.delta_modules import QuantizedDeltaLinear
+        from roboverse_learn.il.delta.delta_modules import QuantizedDeltaLinear, QuantizedDeltaConv1d
         for dl in self._adapter.delta_layers:
-            # Monkey-patch forward to skip quantization
             dl._orig_forward = dl.forward
-            base = dl._base_linear
 
-            def make_float_forward(delta_layer, base_linear):
-                def float_forward(x):
-                    import torch.nn.functional as _F
-                    numel = delta_layer._weight_shape.numel()
-                    delta_w = delta_layer.delta[:numel].view(delta_layer._weight_shape)
-                    weight = base_linear.weight + delta_w
-                    return _F.linear(x, weight, base_linear.bias)
-                return float_forward
+            if isinstance(dl, QuantizedDeltaLinear):
+                base = dl._base_linear
 
-            dl.forward = make_float_forward(dl, base)
+                def make_float_forward_linear(delta_layer, base_linear):
+                    def float_forward(x):
+                        import torch.nn.functional as _F
+                        numel = delta_layer._weight_shape.numel()
+                        delta_w = delta_layer.delta[:numel].view(delta_layer._weight_shape)
+                        weight = base_linear.weight + delta_w
+                        return _F.linear(x, weight, base_linear.bias)
+                    return float_forward
+
+                dl.forward = make_float_forward_linear(dl, base)
+
+            elif isinstance(dl, QuantizedDeltaConv1d):
+                base = dl._base_conv
+
+                def make_float_forward_conv1d(delta_layer, base_conv):
+                    def float_forward(x):
+                        import torch.nn.functional as _F
+                        numel = delta_layer._weight_shape.numel()
+                        delta_w = delta_layer.delta[:numel].view(delta_layer._weight_shape)
+                        weight = base_conv.weight + delta_w
+                        return _F.conv1d(
+                            x, weight, base_conv.bias,
+                            stride=base_conv.stride,
+                            padding=base_conv.padding,
+                            dilation=base_conv.dilation,
+                            groups=base_conv.groups,
+                        )
+                    return float_forward
+
+                dl.forward = make_float_forward_conv1d(dl, base)
         return self
 
     def __exit__(self, *args):
@@ -396,7 +450,8 @@ def main():
 
     # 3. Dataset and dataloader (distributed-aware)
     if is_main:
-        print(f"Loading dataset: {args.data_dir}")
+        for d in args.data_dir:
+            print(f"Loading dataset: {d}")
     dataset, val_dataset = create_dataset(args.data_dir, cfg, args.val_ratio, args.batch_size)
 
     dataloader = create_dataloader(
@@ -550,80 +605,82 @@ def main():
             val_loss = None
             if val_dataloader is not None and epoch % args.val_every == 0:
                 adapter.eval()
-                val_losses = []
-                with torch.no_grad():
-                    for val_idx, raw_val_batch in enumerate(val_dataloader):
-                        val_batch = val_dataset.postprocess(raw_val_batch, str(device))
-                        vloss = adapter.compute_loss(base_policy, val_batch)
-                        val_losses.append(vloss.item())
-                        if val_idx >= args.max_val_steps - 1:
-                            break
-                if val_losses:
-                    val_loss = sum(val_losses) / len(val_losses)
+                val_ctx = _BypassQuantization(adapter) if use_bypass else nullcontext()
+                with val_ctx:
+                    val_losses = []
+                    with torch.no_grad():
+                        for val_idx, raw_val_batch in enumerate(val_dataloader):
+                            val_batch = val_dataset.postprocess(raw_val_batch, str(device))
+                            vloss = adapter.compute_loss(base_policy, val_batch)
+                            val_losses.append(vloss.item())
+                            if val_idx >= args.max_val_steps - 1:
+                                break
+                    if val_losses:
+                        val_loss = sum(val_losses) / len(val_losses)
 
-                # --- Latent space visualization ---
-                if hasattr(base_policy, 'get_latents_for_visualization'):
-                    try:
-                        with torch.no_grad():
-                            all_history_latents = []
-                            all_future_latents = []
-                            max_samples = 500
-                            first_batch = None
+                    # --- Latent space visualization ---
+                    if hasattr(base_policy, 'get_latents_for_visualization'):
+                        try:
+                            with torch.no_grad():
+                                all_history_latents = []
+                                all_future_latents = []
+                                max_samples = 500
+                                first_batch = None
 
-                            for raw_viz_batch in val_dataloader:
-                                viz_batch = val_dataset.postprocess(raw_viz_batch, str(device))
-                                if (
-                                    getattr(adapter, "_task_idx", None) is not None
-                                    and "task_idx" not in viz_batch
-                                ):
-                                    B, T = viz_batch["action"].shape[:2]
-                                    viz_batch = {
-                                        **viz_batch,
-                                        "task_idx": torch.full(
-                                            (B, T), adapter._task_idx,
-                                            dtype=torch.long,
-                                            device=viz_batch["action"].device,
-                                        ),
-                                    }
-                                if first_batch is None:
-                                    first_batch = viz_batch
-                                h_lat, f_lat = base_policy.get_latents_for_visualization(viz_batch)
-                                all_history_latents.append(h_lat.cpu())
-                                all_future_latents.append(f_lat.cpu())
-                                if sum(h.shape[0] for h in all_history_latents) >= max_samples:
-                                    break
+                                for raw_viz_batch in val_dataloader:
+                                    viz_batch = val_dataset.postprocess(raw_viz_batch, str(device))
+                                    if (
+                                        getattr(adapter, "_task_idx", None) is not None
+                                        and "task_idx" not in viz_batch
+                                    ):
+                                        B, T = viz_batch["action"].shape[:2]
+                                        viz_batch = {
+                                            **viz_batch,
+                                            "task_idx": torch.full(
+                                                (B, T), adapter._task_idx,
+                                                dtype=torch.long,
+                                                device=viz_batch["action"].device,
+                                            ),
+                                        }
+                                    if first_batch is None:
+                                        first_batch = viz_batch
+                                    h_lat, f_lat = base_policy.get_latents_for_visualization(viz_batch)
+                                    all_history_latents.append(h_lat.cpu())
+                                    all_future_latents.append(f_lat.cpu())
+                                    if sum(h.shape[0] for h in all_history_latents) >= max_samples:
+                                        break
 
-                            history_latents = torch.cat(all_history_latents, dim=0)[:max_samples]
-                            future_latents = torch.cat(all_future_latents, dim=0)[:max_samples]
+                                history_latents = torch.cat(all_history_latents, dim=0)[:max_samples]
+                                future_latents = torch.cat(all_future_latents, dim=0)[:max_samples]
 
-                            trajectories = None
-                            trajectory_targets = None
-                            if hasattr(base_policy, 'get_flow_trajectories') and first_batch is not None:
-                                trajectories, trajectory_targets = base_policy.get_flow_trajectories(
-                                    first_batch, n_samples=5,
+                                trajectories = None
+                                trajectory_targets = None
+                                if hasattr(base_policy, 'get_flow_trajectories') and first_batch is not None:
+                                    trajectories, trajectory_targets = base_policy.get_flow_trajectories(
+                                        first_batch, n_samples=5,
+                                    )
+
+                                viz_dir = pathlib.Path(args.output_dir) / "latent_viz"
+                                viz_results = plot_all_latent_visualizations(
+                                    history_latents=history_latents,
+                                    future_latents=future_latents,
+                                    epoch=epoch,
+                                    save_dir=str(viz_dir),
+                                    trajectories=trajectories,
+                                    trajectory_targets=trajectory_targets,
                                 )
+                                print(f"  Latent viz saved to {viz_dir}  "
+                                      f"avg_tsne_dist={viz_results['avg_tsne_distance']:.2f}")
 
-                            viz_dir = pathlib.Path(args.output_dir) / "latent_viz"
-                            viz_results = plot_all_latent_visualizations(
-                                history_latents=history_latents,
-                                future_latents=future_latents,
-                                epoch=epoch,
-                                save_dir=str(viz_dir),
-                                trajectories=trajectories,
-                                trajectory_targets=trajectory_targets,
-                            )
-                            print(f"  Latent viz saved to {viz_dir}  "
-                                  f"avg_tsne_dist={viz_results['avg_tsne_distance']:.2f}")
-
-                            if wandb_run is not None:
-                                latent_metrics = {
-                                    "latent/avg_tsne_distance": viz_results['avg_tsne_distance'],
-                                }
-                                if 'flow_end_to_target_dist' in viz_results:
-                                    latent_metrics["latent/flow_end_to_target_dist"] = viz_results['flow_end_to_target_dist']
-                                wandb_run.log(latent_metrics, step=global_step)
-                    except Exception as e:
-                        print(f"  Warning: latent visualization failed: {e}")
+                                if wandb_run is not None:
+                                    latent_metrics = {
+                                        "latent/avg_tsne_distance": viz_results['avg_tsne_distance'],
+                                    }
+                                    if 'flow_end_to_target_dist' in viz_results:
+                                        latent_metrics["latent/flow_end_to_target_dist"] = viz_results['flow_end_to_target_dist']
+                                    wandb_run.log(latent_metrics, step=global_step)
+                        except Exception as e:
+                            print(f"  Warning: latent visualization failed: {e}")
 
             # --- Print ---
             quant_tag = " [float warmup]" if use_bypass else ""

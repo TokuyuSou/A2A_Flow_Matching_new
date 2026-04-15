@@ -66,7 +66,15 @@ def run_episodes(worker_id, episode_ids, task_name, eval_dir, args, result_queue
 
     load_fn = A2ADeltaAdapter.load_quantized if args.quantized else A2ADeltaAdapter.load
     adapter = load_fn(args.adapter_path, base_policy, device=str(device))
+    if args.quant_dtype is not None:
+        dtype = getattr(torch, args.quant_dtype)
+        for dl in adapter.delta_layers:
+            dl.scale.data = dl.scale.data.to(dtype)
+            dl.zero_point.data = dl.zero_point.data.to(dtype)
     adapter.eval()
+
+    if args.num_sampling_steps is not None:
+        base_policy.num_sampling_steps = args.num_sampling_steps
 
     seed = args.seed + worker_id
     np.random.seed(seed)
@@ -227,6 +235,11 @@ def main():
     parser.add_argument("--eval_dir", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_sampling_steps", type=int, default=None,
+                        help="Override flow matching sampling steps (default: use checkpoint value)")
+    parser.add_argument("--quant_dtype", type=str, default=None,
+                        choices=["bfloat16", "float16"],
+                        help="Cast scale/zero_point to this dtype before eval (default: keep float32)")
     args = parser.parse_args()
 
     if args.eval_dir is None:
@@ -238,6 +251,7 @@ def main():
     print(f"Adapter         : {args.adapter_path}")
     print(f"Task            : {args.task_name}")
     print(f"Quantized       : {args.quantized}")
+    print(f"Quant dtype     : {args.quant_dtype or 'float32 (default)'}")
 
     results = evaluate(args.task_name, args.eval_dir, args)
 

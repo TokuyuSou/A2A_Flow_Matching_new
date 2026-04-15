@@ -176,16 +176,130 @@ class QuantizedDeltaLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# QuantizedDeltaConv1d: drop-in replacement for nn.Conv1d
+# ---------------------------------------------------------------------------
+
+class QuantizedDeltaConv1d(nn.Module):
+    """Wraps a frozen ``nn.Conv1d`` with a trainable 4-bit quantized delta.
+
+    Identical quantization scheme to :class:`QuantizedDeltaLinear` but applied
+    to convolutional weights of shape ``(out_channels, in_channels, kernel_size)``.
+
+    Parameters
+    ----------
+    base_conv : nn.Conv1d
+        Frozen base layer from pre-training.
+    block_size : int
+        Number of elements per quantization block.
+    n_bits : int
+        Bit-width for quantization (default 4 -> 16 levels, 0..15).
+    """
+
+    def __init__(self, base_conv: nn.Conv1d, block_size: int = 64, n_bits: int = 4):
+        super().__init__()
+
+        object.__setattr__(self, "_base_conv", base_conv)
+
+        self.block_size = block_size
+        self.n_bits = n_bits
+        self.q_max = float((1 << n_bits) - 1)
+
+        weight_shape = base_conv.weight.shape  # (out_ch, in_ch, kernel_size)
+        numel = weight_shape.numel()
+        self._weight_shape = weight_shape
+
+        self._n_padded = (block_size - numel % block_size) % block_size
+        n_total = numel + self._n_padded
+        n_blocks = n_total // block_size
+
+        self.delta = nn.Parameter(torch.zeros(n_total))
+        self.scale = nn.Parameter(torch.full((n_blocks,), 0.01))
+        self.zero_point = nn.Parameter(torch.full((n_blocks,), float(int(self.q_max) // 2)))
+
+    def _fake_quantize_delta(self) -> torch.Tensor:
+        bs = self.block_size
+        delta_blocks = self.delta.view(-1, bs)
+        s = self.scale.abs().unsqueeze(1)
+        z = self.zero_point.unsqueeze(1)
+        x_scaled = delta_blocks / (s + 1e-8) + z
+        x_int = _fake_quantize_ste(x_scaled, self.q_max)
+        delta_q = s * (x_int - z)
+        delta_flat = delta_q.reshape(-1)
+        if self._n_padded > 0:
+            delta_flat = delta_flat[: delta_flat.numel() - self._n_padded]
+        return delta_flat.view(self._weight_shape)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        delta_w = self._fake_quantize_delta()
+        weight = self._base_conv.weight + delta_w
+        return F.conv1d(
+            x, weight, self._base_conv.bias,
+            stride=self._base_conv.stride,
+            padding=self._base_conv.padding,
+            dilation=self._base_conv.dilation,
+            groups=self._base_conv.groups,
+        )
+
+    def get_quantized_state(self) -> dict:
+        with torch.no_grad():
+            bs = self.block_size
+            delta_blocks = self.delta.view(-1, bs)
+            s = self.scale.abs().unsqueeze(1)
+            z = self.zero_point.unsqueeze(1)
+            x_scaled = delta_blocks / (s + 1e-8) + z
+            x_int = x_scaled.clamp(0, self.q_max).round().to(torch.uint8)
+            return {
+                "codes": x_int,
+                "scale": self.scale.data,
+                "zero_point": self.zero_point.data,
+                "weight_shape": self._weight_shape,
+                "n_padded": self._n_padded,
+                "block_size": self.block_size,
+                "n_bits": self.n_bits,
+            }
+
+    def load_quantized_state(self, state: dict):
+        with torch.no_grad():
+            self.scale.copy_(state["scale"])
+            self.zero_point.copy_(state["zero_point"])
+            codes = state["codes"].float()
+            s = self.scale.abs().unsqueeze(1)
+            z = self.zero_point.unsqueeze(1)
+            delta_blocks = s * (codes - z)
+            self.delta.copy_(delta_blocks.reshape(-1))
+
+    @property
+    def in_channels(self) -> int:
+        return self._base_conv.in_channels
+
+    @property
+    def out_channels(self) -> int:
+        return self._base_conv.out_channels
+
+    @property
+    def kernel_size(self):
+        return self._base_conv.kernel_size
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_ch={self.in_channels}, out_ch={self.out_channels}, "
+            f"kernel_size={self.kernel_size}, "
+            f"block_size={self.block_size}, n_bits={self.n_bits}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # A2ADeltaAdapter: manages injection into all trainable modules
 # ---------------------------------------------------------------------------
 
 class A2ADeltaAdapter(nn.Module):
     """4-bit delta adapter for :class:`A2AImagePolicy`.
 
-    Injects :class:`QuantizedDeltaLinear` into **every** ``nn.Linear`` layer
-    of the trainable modules (flow_net, action_decoder, obs_projector,
-    action_encoder, history_action_encoder).  Only ``obs_encoder`` (frozen
-    vision backbone) is excluded.
+    Injects :class:`QuantizedDeltaLinear` into every ``nn.Linear`` and
+    :class:`QuantizedDeltaConv1d` into every ``nn.Conv1d`` of the trainable
+    modules (flow_net, action_decoder, obs_projector, action_encoder,
+    history_action_encoder).  Only ``obs_encoder`` (frozen vision backbone)
+    is excluded.
 
     Parameters
     ----------
@@ -227,23 +341,23 @@ class A2ADeltaAdapter(nn.Module):
         # Track (parent, attr, original) for restore.
         self._injection_records: List[Tuple[nn.Module, str, nn.Module]] = []
 
-        # --- Inject into all trainable Linear layers ---
+        # --- Inject into all trainable Linear and Conv1d layers ---
         self.delta_layers = nn.ModuleList()
 
         # 1) flow_net: all Linear layers
-        self._inject_all_linears(base_policy.flow_net, block_size, n_bits)
+        self._inject_all(base_policy.flow_net, block_size, n_bits)
 
         # 2) action_decoder: all Linear layers
-        self._inject_all_linears(base_policy.action_decoder, block_size, n_bits)
+        self._inject_all(base_policy.action_decoder, block_size, n_bits)
 
         # 3) obs_projector (single Linear)
         self._inject_linear(base_policy, "obs_projector", block_size, n_bits)
 
-        # 4) action_encoder: all Linear layers (latent_proj, etc.)
-        self._inject_all_linears(base_policy.action_encoder, block_size, n_bits)
+        # 4) action_encoder: all Linear and Conv1d layers
+        self._inject_all(base_policy.action_encoder, block_size, n_bits)
 
-        # 5) history_action_encoder: all Linear layers
-        self._inject_all_linears(base_policy.history_action_encoder, block_size, n_bits)
+        # 5) history_action_encoder: all Linear and Conv1d layers
+        self._inject_all(base_policy.history_action_encoder, block_size, n_bits)
 
     # ------------------------------------------------------------------ #
     #  Injection helpers                                                  #
@@ -264,20 +378,37 @@ class A2ADeltaAdapter(nn.Module):
         self.delta_layers.append(delta_layer)
         return delta_layer
 
-    def _inject_all_linears(
+    def _inject_conv1d(
+        self, parent: nn.Module, attr_name: str,
+        block_size: int, n_bits: int,
+    ) -> QuantizedDeltaConv1d:
+        original = getattr(parent, attr_name)
+        assert isinstance(original, nn.Conv1d), (
+            f"Expected nn.Conv1d at {type(parent).__name__}.{attr_name}, "
+            f"got {type(original).__name__}"
+        )
+        delta_layer = QuantizedDeltaConv1d(original, block_size=block_size, n_bits=n_bits)
+        self._injection_records.append((parent, attr_name, original))
+        setattr(parent, attr_name, delta_layer)
+        self.delta_layers.append(delta_layer)
+        return delta_layer
+
+    def _inject_all(
         self, module: nn.Module, block_size: int, n_bits: int,
     ):
-        """Recursively find and inject all ``nn.Linear`` layers in *module*."""
+        """Recursively find and inject all ``nn.Linear`` and ``nn.Conv1d`` layers in *module*."""
         for name, child in list(module.named_modules()):
-            if not isinstance(child, nn.Linear):
+            if not isinstance(child, (nn.Linear, nn.Conv1d)):
                 continue
-            # Resolve parent + attr from dotted name
             parts = name.split(".")
             parent = module
             for part in parts[:-1]:
                 parent = getattr(parent, part)
             attr_name = parts[-1]
-            self._inject_linear(parent, attr_name, block_size, n_bits)
+            if isinstance(child, nn.Linear):
+                self._inject_linear(parent, attr_name, block_size, n_bits)
+            else:
+                self._inject_conv1d(parent, attr_name, block_size, n_bits)
 
     def restore(self):
         """Remove all delta injections, restoring original layers."""
@@ -463,6 +594,74 @@ def _self_test():
 
     print("\n" + "=" * 60)
     print("All QuantizedDeltaLinear tests passed!")
+    print("=" * 60)
+
+    # --- QuantizedDeltaConv1d tests ---
+    print("\n" + "=" * 60)
+    print("Testing QuantizedDeltaConv1d ...")
+    print("=" * 60)
+
+    base_conv = nn.Conv1d(9, 512, kernel_size=5, stride=2, padding=2)
+    base_conv.requires_grad_(False)
+    qdc = QuantizedDeltaConv1d(base_conv, block_size=32, n_bits=4)
+
+    x_conv = torch.randn(2, 9, 8)  # (B, in_channels, seq_len)
+
+    # 1. Initial output matches base (delta is zero).
+    with torch.no_grad():
+        diff = (qdc(x_conv) - base_conv(x_conv)).abs().max().item()
+    assert diff < 1e-5, f"Initial output diverges: max diff = {diff}"
+    print("  [OK] Initial output matches base (delta=0)")
+
+    # 2. state_dict contains only delta params.
+    sd_keys = set(qdc.state_dict().keys())
+    expected_keys = {"delta", "scale", "zero_point"}
+    assert sd_keys == expected_keys, f"Unexpected keys: {sd_keys}"
+    print(f"  [OK] state_dict keys: {sd_keys}")
+
+    # 3. Gradients flow to delta, scale, zero_point.
+    qdc.zero_grad()
+    loss = qdc(x_conv).sum()
+    loss.backward()
+    assert qdc.delta.grad is not None, "No grad on delta"
+    assert qdc.scale.grad is not None, "No grad on scale"
+    assert qdc.zero_point.grad is not None, "No grad on zero_point"
+    print("  [OK] Gradients flow to delta, scale, zero_point")
+
+    # 4. Output shape matches base conv.
+    with torch.no_grad():
+        out_shape = qdc(x_conv).shape
+        expected_shape = base_conv(x_conv).shape
+    assert out_shape == expected_shape, f"Shape mismatch: {out_shape} vs {expected_shape}"
+    print(f"  [OK] Output shape correct: {out_shape}")
+
+    # 5. After training, output differs from base.
+    opt = torch.optim.Adam(qdc.parameters(), lr=0.1)
+    target_conv = torch.randn_like(base_conv(x_conv))
+    for _ in range(20):
+        opt.zero_grad()
+        out = qdc(x_conv)
+        loss = F.mse_loss(out, target_conv)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        diff = (qdc(x_conv) - base_conv(x_conv)).abs().max().item()
+    assert diff > 0.01, f"Delta not learned: max diff = {diff}"
+    print(f"  [OK] After training, output differs from base (diff={diff:.4f})")
+
+    # 6. Quantized save/load round-trip.
+    qs_conv = qdc.get_quantized_state()
+    qdc2 = QuantizedDeltaConv1d(base_conv, block_size=32, n_bits=4)
+    qdc2.load_quantized_state(qs_conv)
+    with torch.no_grad():
+        out1 = qdc(x_conv)
+        out2 = qdc2(x_conv)
+        diff = (out1 - out2).abs().max().item()
+    assert diff < 0.1, f"Quantized round-trip diverges: {diff}"
+    print(f"  [OK] Quantized save/load round-trip (max diff={diff:.6f})")
+
+    print("\n" + "=" * 60)
+    print("All QuantizedDeltaConv1d tests passed!")
     print("=" * 60)
 
 
